@@ -1,15 +1,16 @@
 # ============================================================
-# STEP 1 — SCAFFOLD: application entry point
-# WHY: a single, tiny entry point that just launches the GUI
-#      keeps startup logic in one obvious place. Real wiring
-#      (constructing the GUI, passing it a cache handle, etc.)
-#      lands in a later step once gui.py and cache.py exist.
+# STEP 6 — application entry point
+# WHY: main.py's only job is to start the GUI. All real wiring
+#      (building the Cache, constructing the Tk window, starting
+#      the event loop) lives in gui.run_app() so that gui.py stays
+#      independently runnable and testable on its own.
 # ============================================================
 
+from gui import run_app
+
+
 def main() -> None:
-    # STEP 6 will replace this with: build a Cache, build the
-    # Tkinter root window, hand both to gui.App, call mainloop().
-    print("Local Lead Finder — scaffold only. GUI not wired up yet.")
+    run_app()
 
 
 if __name__ == "__main__":

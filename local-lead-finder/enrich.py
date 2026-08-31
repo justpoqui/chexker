@@ -210,6 +210,7 @@ def enrich_businesses(
     businesses: list[Business],
     cache: Cache,
     status_cb: Callable[[str], None] = lambda msg: None,
+    on_result: Callable[[Business, EnrichmentResult], None] = lambda business, result: None,
 ) -> dict[int, EnrichmentResult]:
     """Enrich every business with a real (non-social) website.
 
@@ -217,6 +218,11 @@ def enrich_businesses(
     business whose website was worth checking. Businesses already resolved
     to NO_PRESENCE / SOCIAL_ONLY / FACEBOOK_ONLY from OSM tags alone don't
     need a fetch at all, and are simply absent from the result.
+
+    `on_result` fires once per business as soon as its host's check
+    completes (not only when the whole batch finishes) — STEP 6's GUI uses
+    this to update table rows live instead of showing nothing until every
+    website has been checked.
     """
     businesses_by_domain: dict[str, list[Business]] = {}
     for business in businesses:
@@ -253,6 +259,7 @@ def enrich_businesses(
             domain, result = future.result()
             for business in businesses_by_domain[domain]:
                 results[business.osm_id] = result
+                on_result(business, result)
             with progress_lock:
                 completed += 1
                 status_cb(f"Checked {completed}/{total} websites ({domain})")
