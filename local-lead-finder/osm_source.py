@@ -10,8 +10,7 @@ import hashlib
 import json
 import sys
 import time
-import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import requests
@@ -245,6 +244,135 @@ def make_radius_area(lat: float, lon: float, radius_miles: float) -> SearchArea:
 
 
 # ============================================================
+# STEP 3 — BUSINESS QUERY: pulling named, business-like objects
+# WHY: this is the query that actually produces leads. It covers
+#      both SearchArea modes from STEP 2, requires a name tag
+#      (an unnamed shop can't be pitched or called), and uses
+#      `out center tags;` so ways/relations come back with one
+#      representative coordinate instead of full geometry — much
+#      smaller responses for the same information.
+# ============================================================
+
+# Every one of these is a toggle in the GUI (STEP 6); all are on by default.
+ALL_CATEGORY_KEYS = ("shop", "amenity", "craft", "office", "healthcare", "leisure", "tourism")
+
+
+@dataclass
+class Business:
+    """One named, business-like OSM object — a candidate lead."""
+
+    osm_type: str
+    osm_id: int
+    name: str
+    category_key: str
+    category_value: str
+    lat: Optional[float]
+    lon: Optional[float]
+    phone: Optional[str]
+    website: Optional[str]
+    facebook: Optional[str]
+    instagram: Optional[str]
+    address: str
+    opening_hours: Optional[str]
+    raw_tags: dict = field(default_factory=dict)
+
+
+def _validate_category_keys(category_keys) -> list[str]:
+    keys = [key for key in category_keys if key in ALL_CATEGORY_KEYS]
+    if not keys:
+        raise ValueError(
+            f"No valid category keys given; choose from {ALL_CATEGORY_KEYS}"
+        )
+    return keys
+
+
+def build_business_query(area: SearchArea, category_keys) -> str:
+    """Build the nwr query for one SearchArea, restricted to the given keys."""
+    keys = _validate_category_keys(category_keys)
+
+    if area.mode == "named":
+        header = f"[out:json][timeout:90];\narea(id:{area.area_id})->.a;\n"
+        filters = "\n".join(f'  nwr["{key}"]["name"](area.a);' for key in keys)
+    elif area.mode == "radius":
+        header = "[out:json][timeout:90];\n"
+        around = f"around:{area.radius_m:.1f},{area.lat},{area.lon}"
+        filters = "\n".join(f'  nwr["{key}"]["name"]({around});' for key in keys)
+    else:
+        raise ValueError(f"Unknown SearchArea mode: {area.mode!r}")
+
+    return f"{header}(\n{filters}\n);\nout center tags;"
+
+
+def _format_address(tags: dict) -> str:
+    street = " ".join(
+        part for part in (tags.get("addr:housenumber"), tags.get("addr:street")) if part
+    )
+    locality = ", ".join(
+        part
+        for part in (tags.get("addr:city"), tags.get("addr:state"), tags.get("addr:postcode"))
+        if part
+    )
+    return ", ".join(part for part in (street, locality) if part)
+
+
+def _element_to_business(element: dict, category_keys: list[str]) -> Optional[Business]:
+    tags = element.get("tags", {})
+    name = tags.get("name")
+    if not name:
+        return None
+
+    # Use whichever requested category key this element actually has; an
+    # object can carry more than one (e.g. shop + office), so the first
+    # match in the caller's key order wins.
+    category_key = next((key for key in category_keys if key in tags), None)
+    if category_key is None:
+        return None
+
+    if element["type"] == "node":
+        lat, lon = element.get("lat"), element.get("lon")
+    else:
+        center = element.get("center", {})
+        lat, lon = center.get("lat"), center.get("lon")
+
+    return Business(
+        osm_type=element["type"],
+        osm_id=element["id"],
+        name=name,
+        category_key=category_key,
+        category_value=tags[category_key],
+        lat=lat,
+        lon=lon,
+        phone=tags.get("phone") or tags.get("contact:phone"),
+        website=tags.get("website") or tags.get("contact:website") or tags.get("url"),
+        facebook=tags.get("contact:facebook"),
+        instagram=tags.get("contact:instagram"),
+        address=_format_address(tags),
+        opening_hours=tags.get("opening_hours"),
+        raw_tags=tags,
+    )
+
+
+def search_businesses(
+    area: SearchArea,
+    category_keys,
+    cache: Cache,
+    status_cb: Callable[[str], None] = lambda msg: None,
+) -> list[Business]:
+    """Run the STEP 3 business query for `area` and return parsed Businesses."""
+    keys = _validate_category_keys(category_keys)
+    query = build_business_query(area, keys)
+    data = query_overpass(query, cache, status_cb)
+
+    businesses = [
+        business
+        for element in data.get("elements", [])
+        if (business := _element_to_business(element, keys)) is not None
+    ]
+    status_cb(f"{len(businesses)} named businesses found.")
+    return businesses
+
+
+# ============================================================
 # STEP 2 — OPTIONAL: Nominatim geocoding (off by default)
 # WHY: turning a typed street address into lat/lon needs a
 #      geocoder, and Nominatim is the only free, key-less option.
@@ -289,23 +417,44 @@ def geocode_address(address: str, cache: Cache) -> Optional[tuple[float, float]]
 
 
 # ============================================================
-# STEP 2 — manual smoke test
-# WHY: gui.py doesn't exist yet, so this lets the area-resolution
-#      logic above be exercised from the terminal before STEP 3
-#      builds anything on top of it.
+# STEP 2/3 — manual smoke test
+# WHY: gui.py doesn't exist yet, so this lets area resolution and
+#      the business query be exercised from the terminal before
+#      scoring.py (STEP 4) has anything to consume them.
 # ============================================================
 
 if __name__ == "__main__":
     cache = Cache()
+
     if len(sys.argv) >= 2 and sys.argv[1] == "radius":
         _, _, lat, lon, radius = sys.argv
         area = make_radius_area(float(lat), float(lon), float(radius))
         print(area)
+
+    elif len(sys.argv) >= 2 and sys.argv[1] == "businesses":
+        _, _, place_name, *category_keys = sys.argv
+        area = resolve_named_area(place_name, cache, status_cb=print)
+        if area is None:
+            print("No match found (or selection cancelled).")
+        else:
+            print(f"Searching {area.label} ...")
+            businesses = search_businesses(
+                area, category_keys or ALL_CATEGORY_KEYS, cache, status_cb=print
+            )
+            for business in businesses[:20]:
+                print(
+                    f"- {business.name} [{business.category_value}] "
+                    f"phone={business.phone} website={business.website} "
+                    f"fb={business.facebook}"
+                )
+
     elif len(sys.argv) >= 2:
         place_name = " ".join(sys.argv[1:])
         area = resolve_named_area(place_name, cache, status_cb=print)
         print(area if area else "No match found (or selection cancelled).")
+
     else:
         print("Usage:")
         print('  python osm_source.py "Grand Rapids"')
         print("  python osm_source.py radius 42.9634 -85.6681 5")
+        print('  python osm_source.py businesses "Grand Rapids" shop craft office')
