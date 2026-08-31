@@ -276,6 +276,14 @@ class Business:
     opening_hours: Optional[str]
     raw_tags: dict = field(default_factory=dict)
 
+    @property
+    def osm_key(self) -> str:
+        # osm_id alone isn't unique across element types — a node and a way
+        # can share the same numeric id — so anything that needs a stable,
+        # collision-free identifier for a business (the leads table, the
+        # results table's row id, the CSV's osm_id column) uses this instead.
+        return f"{self.osm_type}/{self.osm_id}"
+
 
 def _validate_category_keys(category_keys) -> list[str]:
     keys = [key for key in category_keys if key in ALL_CATEGORY_KEYS]

@@ -71,6 +71,17 @@ class Cache:
                 )
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS leads (
+                    osm_key        TEXT PRIMARY KEY,
+                    status         TEXT NOT NULL DEFAULT 'new',
+                    last_contacted REAL,
+                    notes          TEXT NOT NULL DEFAULT '',
+                    updated_at     REAL NOT NULL
+                )
+                """
+            )
 
     # -- Overpass response cache -----------------------------------
 
@@ -151,6 +162,48 @@ class Cache:
                     fetched_at = excluded.fetched_at
                 """,
                 (domain, json.dumps(result)),
+            )
+
+    # ============================================================
+    # STEP 10 — LEAD STATE TRACKING
+    # WHY: without this, the app has no memory — the same hottest
+    #      leads resurface at the top of every run even after
+    #      they've been called. This table is the app's only
+    #      persistent, user-authored data (everything else here is
+    #      a disposable cache of someone else's data), so unlike
+    #      the tables above it is never expired or overwritten by
+    #      a re-fetch — only by the user explicitly changing a
+    #      lead's status.
+    # ============================================================
+
+    def get_all_leads(self) -> dict[str, dict]:
+        """Every lead's status/notes, keyed by osm_key. Loaded once at
+        startup; the GUI keeps its own in-memory copy from then on and
+        only writes back through set_lead()."""
+        with self._lock:
+            cursor = self._conn.execute("SELECT osm_key, status, last_contacted, notes FROM leads")
+            rows = cursor.fetchall()
+        return {
+            osm_key: {"status": status, "last_contacted": last_contacted, "notes": notes}
+            for osm_key, status, last_contacted, notes in rows
+        }
+
+    def set_lead(self, osm_key: str, status: str, notes: str = "") -> None:
+        # "new" means "no action taken yet" — leave last_contacted unset so
+        # the GUI can distinguish "never touched" from "touched a while ago".
+        touched_now = None if status == "new" else time.time()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO leads (osm_key, status, last_contacted, notes, updated_at)
+                VALUES (?, ?, ?, ?, strftime('%s', 'now'))
+                ON CONFLICT(osm_key) DO UPDATE SET
+                    status = excluded.status,
+                    last_contacted = COALESCE(excluded.last_contacted, leads.last_contacted),
+                    notes = excluded.notes,
+                    updated_at = excluded.updated_at
+                """,
+                (osm_key, status, touched_now, notes),
             )
 
     def close(self) -> None:

@@ -38,15 +38,34 @@ TIER_COLORS = {
     "HEALTHY": "#c8f0c8",
 }
 
-COLUMNS = ("score", "tier", "name", "category", "phone", "web", "address")
+COLUMNS = ("score", "tier", "status", "name", "category", "phone", "web", "address")
 COLUMN_HEADINGS = {
     "score": "Score",
     "tier": "Tier",
+    "status": "Status",
     "name": "Name",
     "category": "Category",
     "phone": "Phone",
     "web": "Website / FB",
     "address": "Address",
+}
+
+# ============================================================
+# STEP 10 — LEAD STATE TRACKING: statuses a lead can be in
+# WHY: without this the app has no memory between runs — the same
+#      hottest leads keep resurfacing at the top even after
+#      they've already been called. "new" is the only status that
+#      counts as untouched; everything else means some action was
+#      taken, and is what "Hide already contacted" filters out.
+# ============================================================
+
+LEAD_STATUSES = ("new", "contacted", "callback", "not_interested", "won")
+LEAD_STATUS_LABELS = {
+    "new": "New",
+    "contacted": "Contacted",
+    "callback": "Callback",
+    "not_interested": "Not Interested",
+    "won": "Won",
 }
 
 
@@ -172,10 +191,17 @@ class App(ttk.Frame):
         self.cache = cache
         self.pack(fill="both", expand=True)
 
-        # osm_id -> (Business, ScoreResult), so a Treeview selection can
+        # osm_key -> (Business, ScoreResult), so a Treeview selection can
         # look up everything the detail panel needs to show.
         self.rows: dict[str, tuple[Business, ScoreResult]] = {}
         self._sort_reverse: dict[str, bool] = {}
+        self._selected_osm_key: Optional[str] = None
+
+        # Loaded once at startup; every later read/write goes through this
+        # in-memory copy, kept in sync with cache.py's `leads` table by
+        # _on_save_lead_clicked() so the DB is never re-queried per row.
+        self.lead_info: dict[str, dict] = self.cache.get_all_leads()
+        self.hide_contacted_var = tk.BooleanVar(value=False)
 
         self.result_queue: "queue.Queue" = queue.Queue()
         self.worker_thread: Optional[threading.Thread] = None
@@ -282,7 +308,7 @@ class App(ttk.Frame):
         self.tree = ttk.Treeview(table_frame, columns=COLUMNS, show="headings")
         for col in COLUMNS:
             self.tree.heading(col, text=COLUMN_HEADINGS[col], command=lambda c=col: self._sort_by(c))
-            width = 70 if col == "score" else 130 if col in ("tier", "phone") else 200
+            width = 70 if col == "score" else 130 if col in ("tier", "phone", "status") else 200
             self.tree.column(col, width=width, anchor="w")
         for tier, color in TIER_COLORS.items():
             self.tree.tag_configure(tier, background=color)
@@ -343,6 +369,27 @@ class App(ttk.Frame):
         self.detail_reasons_text.grid(row=9, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
         detail.grid_rowconfigure(9, weight=1)
 
+        # -- STEP 10: lead status tracking --
+        ttk.Separator(detail, orient="horizontal").grid(
+            row=10, column=0, columnspan=2, sticky="ew", pady=(10, 6)
+        )
+        ttk.Label(detail, text="Lead status:").grid(row=11, column=0, sticky="w")
+        self.detail_status_var = tk.StringVar(value=LEAD_STATUS_LABELS["new"])
+        status_combo = ttk.Combobox(
+            detail, textvariable=self.detail_status_var, state="readonly",
+            values=[LEAD_STATUS_LABELS[s] for s in LEAD_STATUSES], width=16,
+        )
+        status_combo.grid(row=11, column=1, sticky="w")
+
+        ttk.Label(detail, text="Notes:").grid(row=12, column=0, sticky="nw", pady=(6, 0))
+        self.detail_notes_text = tk.Text(detail, height=3, width=24, wrap="word")
+        self.detail_notes_text.grid(row=12, column=1, sticky="ew", pady=(6, 0))
+
+        self.save_lead_button = ttk.Button(
+            detail, text="Save Lead Info", command=self._on_save_lead_clicked, state="disabled"
+        )
+        self.save_lead_button.grid(row=13, column=0, columnspan=2, sticky="e", pady=(6, 0))
+
     def _build_export_bar(self) -> None:
         bar = ttk.Frame(self, padding=(8, 4))
         bar.grid(row=2, column=0, sticky="ew")
@@ -350,6 +397,10 @@ class App(ttk.Frame):
         ttk.Button(
             bar, text="Copy as Call Sheet", command=self._on_copy_call_sheet_clicked
         ).pack(side="left", padx=(6, 0))
+        ttk.Checkbutton(
+            bar, text="Hide already contacted", variable=self.hide_contacted_var,
+            command=self._refresh_table_visibility,
+        ).pack(side="left", padx=(20, 0))
 
     def _build_status_bar(self) -> None:
         bar = ttk.Frame(self, padding=(8, 4))
@@ -389,9 +440,11 @@ class App(ttk.Frame):
 
     def _row_values(self, business: Business, result: ScoreResult) -> tuple:
         web_or_fb = business.website or business.facebook or business.instagram or "—"
+        status = self._lead_status(business.osm_key)
         return (
             result.score,
             result.tier,
+            LEAD_STATUS_LABELS[status],
             business.name,
             f"{business.category_key}={business.category_value}",
             business.phone or "—",
@@ -399,14 +452,34 @@ class App(ttk.Frame):
             business.address or "—",
         )
 
+    def _lead_status(self, osm_key: str) -> str:
+        return self.lead_info.get(osm_key, {}).get("status", "new")
+
     def _insert_or_update_row(self, business: Business, result: ScoreResult) -> None:
-        iid = str(business.osm_id)
-        self.rows[iid] = (business, result)
+        """Update the data model, then reflect it in the tree — but only insert
+        a tree row if it isn't currently hidden by the "Hide already
+        contacted" filter."""
+        osm_key = business.osm_key
+        self.rows[osm_key] = (business, result)
+
+        hidden = self.hide_contacted_var.get() and self._lead_status(osm_key) != "new"
+        if hidden:
+            if self.tree.exists(osm_key):
+                self.tree.delete(osm_key)
+            return
+
         values = self._row_values(business, result)
-        if self.tree.exists(iid):
-            self.tree.item(iid, values=values, tags=(result.tier,))
+        if self.tree.exists(osm_key):
+            self.tree.item(osm_key, values=values, tags=(result.tier,))
         else:
-            self.tree.insert("", "end", iid=iid, values=values, tags=(result.tier,))
+            self.tree.insert("", "end", iid=osm_key, values=values, tags=(result.tier,))
+
+    def _refresh_table_visibility(self) -> None:
+        """Re-derive which rows the tree shows from self.rows + the current
+        filter state — called when the filter checkbox is toggled, or after
+        a lead's status changes."""
+        for business, result in list(self.rows.values()):
+            self._insert_or_update_row(business, result)
 
     def _sort_by(self, column: str) -> None:
         reverse = self._sort_reverse.get(column, False)
@@ -434,6 +507,13 @@ class App(ttk.Frame):
         self._show_detail(business, result)
 
     def _show_detail(self, business: Business, result: ScoreResult) -> None:
+        self._selected_osm_key = business.osm_key
+        lead = self.lead_info.get(business.osm_key, {})
+        self.detail_status_var.set(LEAD_STATUS_LABELS[lead.get("status", "new")])
+        self.detail_notes_text.delete("1.0", "end")
+        self.detail_notes_text.insert("end", lead.get("notes", ""))
+        self.save_lead_button.configure(state="normal")
+
         self.detail_name_var.set(business.name)
         self.detail_category_var.set(f"{business.category_key} = {business.category_value}")
         self.detail_phone_var.set(business.phone or "—")
@@ -453,6 +533,20 @@ class App(ttk.Frame):
             for flag in result.flags:
                 self.detail_reasons_text.insert("end", f"• {flag}\n")
         self.detail_reasons_text.configure(state="disabled")
+
+    def _on_save_lead_clicked(self) -> None:
+        if self._selected_osm_key is None:
+            return
+        label_to_status = {label: status for status, label in LEAD_STATUS_LABELS.items()}
+        status = label_to_status[self.detail_status_var.get()]
+        notes = self.detail_notes_text.get("1.0", "end").rstrip("\n")
+
+        self.cache.set_lead(self._selected_osm_key, status, notes)
+        self.lead_info[self._selected_osm_key] = {
+            "status": status, "notes": notes, "last_contacted": None,
+        }
+        self._refresh_table_visibility()
+        self.status_var.set(f"Saved lead status: {LEAD_STATUS_LABELS[status]}.")
 
     # -- export -------------------------------------------------
 
@@ -524,6 +618,8 @@ class App(ttk.Frame):
 
         self.tree.delete(*self.tree.get_children())
         self.rows.clear()
+        self._selected_osm_key = None
+        self.save_lead_button.configure(state="disabled")
         self._cache_hits = 0
         self.cache_hit_var.set("Cache hits: 0")
         self.cancel_event.clear()
@@ -629,7 +725,7 @@ class App(ttk.Frame):
             _, business, result = message
             self._insert_or_update_row(business, result)
             selection = self.tree.selection()
-            if selection and selection[0] == str(business.osm_id):
+            if selection and selection[0] == business.osm_key:
                 self._show_detail(business, result)
 
         elif kind == "error":

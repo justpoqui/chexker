@@ -46,7 +46,7 @@ def _row_dict(business: Business, result: ScoreResult, export_date: str) -> dict
         "address": business.address,
         "lat": business.lat if business.lat is not None else "",
         "lon": business.lon if business.lon is not None else "",
-        "osm_id": f"{business.osm_type}/{business.osm_id}",
+        "osm_id": business.osm_key,
         "flags": "; ".join(result.flags),
         "date_checked": export_date,
     }
