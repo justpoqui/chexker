@@ -9,6 +9,7 @@
 import urllib.parse
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
 from osm_source import Business
@@ -95,6 +96,32 @@ def detect_name_frequency_chains(
         for business in businesses
         if counts[business.name.strip().lower()] >= min_count
     }
+
+
+# ============================================================
+# STEP 12 — STALENESS DATING
+# WHY: a NO_PRESENCE business whose OSM entry hasn't been touched
+#      since 2017 might well have gotten a website since — nobody
+#      updated the record to say so. One that was edited last month
+#      and *still* has no website tag is a much stronger signal: a
+#      mapper was just there and didn't add one, so it more likely
+#      still doesn't exist. osm_source.py's business query now uses
+#      `out center tags meta;` (STEP 3) specifically to get this
+#      timestamp onto every Business.
+# ============================================================
+
+RECENT_EDIT_DAYS = 365
+RECENT_EDIT_BONUS = 10
+
+
+def _edited_within(business: Business, days: int) -> bool:
+    if not business.osm_timestamp:
+        return False
+    try:
+        edited_at = datetime.fromisoformat(business.osm_timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return (datetime.now(timezone.utc) - edited_at).days <= days
 
 
 # ============================================================
@@ -259,6 +286,14 @@ def score_business(
         score += PHONE_BONUS
         reasons.append(f"+{PHONE_BONUS}: has a phone number.")
 
+    if tier == "NO_PRESENCE" and _edited_within(business, RECENT_EDIT_DAYS):
+        score += RECENT_EDIT_BONUS
+        edited_date = business.osm_timestamp[:10]
+        reasons.append(
+            f"+{RECENT_EDIT_BONUS}: OSM record edited recently ({edited_date}) — "
+            "'no website' is more likely still accurate."
+        )
+
     flags = list(enrichment.flags) if enrichment else []
 
     return ScoreResult(tier=tier, score=score, reasons=reasons, flags=flags)
@@ -272,6 +307,11 @@ def score_business(
 # ============================================================
 
 if __name__ == "__main__":
+    from datetime import timedelta
+
+    recent_edit = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat().replace("+00:00", "Z")
+    stale_edit = "2016-01-01T00:00:00Z"
+
     def make_business(**overrides) -> Business:
         defaults = dict(
             osm_type="node", osm_id=1, name="Test Biz", category_key="shop",
@@ -325,6 +365,16 @@ if __name__ == "__main__":
             "chain: brand-tagged, no website (would be NO_PRESENCE=100)",
             make_business(name="Subway", raw_tags={"brand": "Subway", "brand:wikidata": "Q244457"}),
             None, "Tagged as a chain in OSM (brand=Subway).",
+        ),
+        (
+            "no presence, recently edited (+10 staleness bonus)",
+            make_business(osm_timestamp=recent_edit),
+            None, None,
+        ),
+        (
+            "no presence, edited in 2016 (no staleness bonus)",
+            make_business(osm_timestamp=stale_edit),
+            None, None,
         ),
     ]
 

@@ -30,7 +30,7 @@ OSM_ATTRIBUTION = (
 
 CSV_FIELDNAMES = [
     "score", "tier", "name", "category", "phone", "website", "facebook",
-    "address", "lat", "lon", "osm_id", "flags", "date_checked",
+    "address", "lat", "lon", "osm_id", "osm_last_edited", "flags", "date_checked",
 ]
 
 
@@ -47,6 +47,7 @@ def _row_dict(business: Business, result: ScoreResult, export_date: str) -> dict
         "lat": business.lat if business.lat is not None else "",
         "lon": business.lon if business.lon is not None else "",
         "osm_id": business.osm_key,
+        "osm_last_edited": business.osm_timestamp[:10] if business.osm_timestamp else "",
         "flags": "; ".join(result.flags),
         "date_checked": export_date,
     }

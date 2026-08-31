@@ -248,9 +248,10 @@ def make_radius_area(lat: float, lon: float, radius_miles: float) -> SearchArea:
 # WHY: this is the query that actually produces leads. It covers
 #      both SearchArea modes from STEP 2, requires a name tag
 #      (an unnamed shop can't be pitched or called), and uses
-#      `out center tags;` so ways/relations come back with one
+#      `out center tags meta;` so ways/relations come back with one
 #      representative coordinate instead of full geometry — much
-#      smaller responses for the same information.
+#      smaller responses for the same information. `meta` (added in
+#      STEP 12) is what puts a last-edit timestamp on every element.
 # ============================================================
 
 # Every one of these is a toggle in the GUI (STEP 6); all are on by default.
@@ -275,6 +276,8 @@ class Business:
     address: str
     opening_hours: Optional[str]
     raw_tags: dict = field(default_factory=dict)
+    osm_timestamp: Optional[str] = None  # last-edit time, e.g. "2020-01-15T08:23:41Z" (STEP 12)
+    osm_version: Optional[int] = None
 
     @property
     def osm_key(self) -> str:
@@ -308,7 +311,9 @@ def build_business_query(area: SearchArea, category_keys) -> str:
     else:
         raise ValueError(f"Unknown SearchArea mode: {area.mode!r}")
 
-    return f"{header}(\n{filters}\n);\nout center tags;"
+    # STEP 12: "meta" adds each element's last-edit timestamp/version to the
+    # response, on top of "center tags" from STEP 3 — see Business.osm_timestamp.
+    return f"{header}(\n{filters}\n);\nout center tags meta;"
 
 
 def _format_address(tags: dict) -> str:
@@ -357,6 +362,8 @@ def _element_to_business(element: dict, category_keys: list[str]) -> Optional[Bu
         address=_format_address(tags),
         opening_hours=tags.get("opening_hours"),
         raw_tags=tags,
+        osm_timestamp=element.get("timestamp"),
+        osm_version=element.get("version"),
     )
 
 

@@ -39,7 +39,7 @@ TIER_COLORS = {
     "CHAIN": "#d9d9d9",  # deliberately outside the warm-to-cool gradient — not a lead at all
 }
 
-COLUMNS = ("score", "tier", "status", "name", "category", "phone", "web", "address")
+COLUMNS = ("score", "tier", "status", "name", "category", "phone", "web", "address", "edited")
 COLUMN_HEADINGS = {
     "score": "Score",
     "tier": "Tier",
@@ -49,6 +49,7 @@ COLUMN_HEADINGS = {
     "phone": "Phone",
     "web": "Website / FB",
     "address": "Address",
+    "edited": "Last Edited",
 }
 
 # ============================================================
@@ -309,7 +310,7 @@ class App(ttk.Frame):
         self.tree = ttk.Treeview(table_frame, columns=COLUMNS, show="headings")
         for col in COLUMNS:
             self.tree.heading(col, text=COLUMN_HEADINGS[col], command=lambda c=col: self._sort_by(c))
-            width = 70 if col == "score" else 130 if col in ("tier", "phone", "status") else 200
+            width = 70 if col == "score" else 130 if col in ("tier", "phone", "status", "edited") else 200
             self.tree.column(col, width=width, anchor="w")
         for tier, color in TIER_COLORS.items():
             self.tree.tag_configure(tier, background=color)
@@ -442,6 +443,7 @@ class App(ttk.Frame):
     def _row_values(self, business: Business, result: ScoreResult) -> tuple:
         web_or_fb = business.website or business.facebook or business.instagram or "—"
         status = self._lead_status(business.osm_key)
+        edited = business.osm_timestamp[:10] if business.osm_timestamp else "—"
         return (
             result.score,
             result.tier,
@@ -451,6 +453,7 @@ class App(ttk.Frame):
             business.phone or "—",
             web_or_fb,
             business.address or "—",
+            edited,
         )
 
     def _lead_status(self, osm_key: str) -> str:
