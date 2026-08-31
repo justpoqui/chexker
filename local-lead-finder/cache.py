@@ -6,8 +6,10 @@
 #      search must hit this cache, not the network.
 # ============================================================
 
+import json
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -56,6 +58,15 @@ class Cache:
                     address_key TEXT PRIMARY KEY,
                     lat         REAL NOT NULL,
                     lon         REAL NOT NULL,
+                    fetched_at  REAL NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS site_cache (
+                    domain      TEXT PRIMARY KEY,
+                    result_json TEXT NOT NULL,
                     fetched_at  REAL NOT NULL
                 )
                 """
@@ -110,11 +121,38 @@ class Cache:
                 (address_key, lat, lon),
             )
 
+    # -- Website enrichment cache, keyed by domain, with a TTL -------
+    # WHY: unlike Overpass and geocode results, a site's health can
+    #      change (it might get fixed, or go down) so this cache
+    #      expires — the TTL is passed in by the caller (enrich.py
+    #      uses 30 days) rather than hardcoded here.
+
+    def get_site(self, domain: str, ttl_seconds: float) -> Optional[dict]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT result_json, fetched_at FROM site_cache WHERE domain = ?",
+                (domain,),
+            ).fetchone()
+        if row is None:
+            return None
+        result_json, fetched_at = row
+        if time.time() - fetched_at > ttl_seconds:
+            return None
+        return json.loads(result_json)
+
+    def set_site(self, domain: str, result: dict) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO site_cache (domain, result_json, fetched_at)
+                VALUES (?, ?, strftime('%s', 'now'))
+                ON CONFLICT(domain) DO UPDATE SET
+                    result_json = excluded.result_json,
+                    fetched_at = excluded.fetched_at
+                """,
+                (domain, json.dumps(result)),
+            )
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
-
-
-# TODO (STEP 5): a site_cache table (domain -> enrichment result,
-# fetched_at) with a 30-day TTL, added the same way as the two
-# tables above once enrich.py exists to fill it.
