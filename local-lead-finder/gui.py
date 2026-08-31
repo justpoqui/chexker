@@ -36,6 +36,7 @@ TIER_COLORS = {
     "SITE_NO_SOCIAL": "#fff6b0",
     "WEAK_SITE": "#dce8ff",
     "HEALTHY": "#c8f0c8",
+    "CHAIN": "#d9d9d9",  # deliberately outside the warm-to-cool gradient — not a lead at all
 }
 
 COLUMNS = ("score", "tier", "status", "name", "category", "phone", "web", "address")
@@ -673,7 +674,23 @@ class App(ttk.Frame):
                 return
 
             self._status_cb(f"{len(businesses)} businesses found. Checking websites...")
-            initial_rows = [(business, scoring.score_business(business, None)) for business in businesses]
+
+            # Chain/franchise detection runs once, up front, over the whole
+            # batch — a name's frequency can't be known from one Business in
+            # isolation. The resulting reason (or None) is threaded into
+            # every score_business() call below, including the ones
+            # enrichment triggers later, so a chain doesn't un-demote itself
+            # the moment its website finishes checking.
+            name_frequency_chains = scoring.detect_name_frequency_chains(businesses)
+            chain_reasons = {
+                business.osm_key: scoring.chain_reason_for(business, name_frequency_chains)
+                for business in businesses
+            }
+
+            initial_rows = [
+                (business, scoring.score_business(business, None, chain_reasons[business.osm_key]))
+                for business in businesses
+            ]
             self.result_queue.put(("initial_results", initial_rows))
 
             if self.cancel_event.is_set():
@@ -681,7 +698,7 @@ class App(ttk.Frame):
                 return
 
             def on_enriched(business: Business, enrichment) -> None:
-                result = scoring.score_business(business, enrichment)
+                result = scoring.score_business(business, enrichment, chain_reasons[business.osm_key])
                 self.result_queue.put(("row_update", business, result))
 
             enrich.enrich_businesses(

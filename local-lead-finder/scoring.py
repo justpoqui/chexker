@@ -7,6 +7,7 @@
 # ============================================================
 
 import urllib.parse
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -42,9 +43,58 @@ TIER_BASE_SCORES = {
     "SITE_NO_SOCIAL": 60,
     "WEAK_SITE": 40,
     "HEALTHY": 0,
+    "CHAIN": -10,  # see STEP 11 below — always sorts below even a healthy independent site
 }
 
 PHONE_BONUS = 15
+
+
+# ============================================================
+# STEP 11 — CHAIN / FRANCHISE DETECTION
+# WHY: a Subway with no website tag scores 100 under the rules
+#      above and sits at the top of the list, but corporate owns
+#      Subway's web presence — there's no one at that location to
+#      sell a website to. Two independent signals catch this:
+#      OSM's own brand=/brand:wikidata=* tags (when a mapper
+#      bothered to add them), and a name showing up 3+ times in
+#      one search (which usually means a chain even when OSM has
+#      no brand tag for it — mappers are inconsistent about this).
+#
+#      This can't live inside score_business() itself: whether a
+#      name is "frequent" is a property of the whole result set,
+#      not of one Business in isolation. So detection happens once
+#      per search (detect_name_frequency_chains, called by the
+#      caller with the full business list) and the result — a
+#      reason string, or None — is threaded into every
+#      score_business() call for that business, including the ones
+#      Step 5's enrichment triggers later, so a chain doesn't
+#      un-demote itself the moment its website finishes checking.
+# ============================================================
+
+NAME_FREQUENCY_CHAIN_THRESHOLD = 3
+
+
+def chain_reason_for(business: Business, name_frequency_chains: set[str]) -> Optional[str]:
+    """None if `business` doesn't look like a chain; otherwise, why."""
+    brand = business.raw_tags.get("brand") or business.raw_tags.get("brand:wikidata")
+    if brand:
+        return f'Tagged as a chain in OSM (brand={brand}).'
+    if business.osm_key in name_frequency_chains:
+        return f'"{business.name}" appears {NAME_FREQUENCY_CHAIN_THRESHOLD}+ times in this search — likely a chain.'
+    return None
+
+
+def detect_name_frequency_chains(
+    businesses: list[Business], min_count: int = NAME_FREQUENCY_CHAIN_THRESHOLD
+) -> set[str]:
+    """osm_keys of businesses whose name (case/whitespace-insensitive)
+    appears at least `min_count` times among `businesses`."""
+    counts = Counter(business.name.strip().lower() for business in businesses)
+    return {
+        business.osm_key
+        for business in businesses
+        if counts[business.name.strip().lower()] >= min_count
+    }
 
 
 # ============================================================
@@ -147,6 +197,7 @@ class ScoreResult:
 def score_business(
     business: Business,
     enrichment: Optional[EnrichmentResult] = None,
+    chain_reason: Optional[str] = None,
 ) -> ScoreResult:
     """Classify one Business into a tier and score.
 
@@ -155,7 +206,16 @@ def score_business(
     business the instant it comes back from Overpass, and briefly for
     everything with a real website while the enrichment thread pool works
     through the queue.
+
+    `chain_reason`, when given, short-circuits everything else: a business
+    identified as a chain/franchise (see STEP 11's chain_reason_for and
+    detect_name_frequency_chains) is demoted regardless of what tier its
+    web presence would otherwise earn — corporate owns that presence, so
+    a weak or missing website there isn't a sales opportunity.
     """
+    if chain_reason:
+        return ScoreResult(tier="CHAIN", score=TIER_BASE_SCORES["CHAIN"], reasons=[chain_reason])
+
     reasons: list[str] = []
     has_social_tag = bool(business.facebook or business.instagram)
     website_domain = extract_registered_domain(business.website) if business.website else None
@@ -223,46 +283,69 @@ if __name__ == "__main__":
         return Business(**defaults)
 
     cases = [
-        ("no presence, no phone", make_business(), None),
-        ("no presence, with phone", make_business(phone="555-1234"), None),
+        ("no presence, no phone", make_business(), None, None),
+        ("no presence, with phone", make_business(phone="555-1234"), None, None),
         (
             "facebook as website",
             make_business(website="https://www.facebook.com/joeshair"),
-            None,
+            None, None,
         ),
         (
             "NOT a false-positive facebook match",
             make_business(website="https://facebookmarketingpros.com"),
-            None,
+            None, None,
         ),
-        ("social tag only", make_business(facebook="https://facebook.com/kims"), None),
+        ("social tag only", make_business(facebook="https://facebook.com/kims"), None, None),
         (
             "real site, not yet enriched",
             make_business(website="https://joeshair.example.com"),
-            None,
+            None, None,
         ),
         (
             "real site, redirects to instagram",
             make_business(website="https://joeshair.example.com"),
-            EnrichmentResult(checked=True, redirected_to_social="instagram.com"),
+            EnrichmentResult(checked=True, redirected_to_social="instagram.com"), None,
         ),
         (
             "real site, broken",
             make_business(website="https://joeshair.example.com"),
-            EnrichmentResult(checked=True, loads=False),
+            EnrichmentResult(checked=True, loads=False), None,
         ),
         (
             "real site, healthy",
             make_business(website="https://joeshair.example.com", phone="555-1234"),
-            EnrichmentResult(checked=True, loads=True, social_links_found=["facebook.com/joeshair"]),
+            EnrichmentResult(checked=True, loads=True, social_links_found=["facebook.com/joeshair"]), None,
         ),
         (
             "real site, loads but no social",
             make_business(website="https://joeshair.example.com"),
-            EnrichmentResult(checked=True, loads=True, social_links_found=[]),
+            EnrichmentResult(checked=True, loads=True, social_links_found=[]), None,
+        ),
+        (
+            "chain: brand-tagged, no website (would be NO_PRESENCE=100)",
+            make_business(name="Subway", raw_tags={"brand": "Subway", "brand:wikidata": "Q244457"}),
+            None, "Tagged as a chain in OSM (brand=Subway).",
         ),
     ]
 
-    for label, business, enrichment in cases:
-        result = score_business(business, enrichment)
-        print(f"{label:38s} -> {result.tier:15s} score={result.score:3d}  {result.reasons}  flags={result.flags}")
+    for label, business, enrichment, chain_reason in cases:
+        result = score_business(business, enrichment, chain_reason)
+        print(f"{label:55s} -> {result.tier:15s} score={result.score:3d}  {result.reasons}  flags={result.flags}")
+
+    print("\n--- name-frequency chain detection over a batch ---")
+    batch = [
+        make_business(osm_id=1, name="Subway"),
+        make_business(osm_id=2, name="Subway"),
+        make_business(osm_id=3, name="Subway"),
+        make_business(osm_id=4, name="Joe's Independent Diner"),
+    ]
+    frequent = detect_name_frequency_chains(batch)
+    print("flagged as chains by name frequency:", frequent)
+    assert batch[0].osm_key in frequent and batch[1].osm_key in frequent and batch[2].osm_key in frequent
+    assert batch[3].osm_key not in frequent
+    for business in batch:
+        reason = chain_reason_for(business, frequent)
+        result = score_business(business, None, reason)
+        print(f"{business.name:28s} (id {business.osm_id}) -> {result.tier:10s} score={result.score:3d}  reason={reason}")
+
+    print("\nALL OK")
