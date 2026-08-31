@@ -12,15 +12,18 @@ import queue
 import threading
 import tkinter as tk
 import webbrowser
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 import enrich
+import export
 import osm_source
 import scoring
 from cache import Cache
 from osm_source import ALL_CATEGORY_KEYS, AreaCandidate, Business
 from scoring import ScoreResult
+
+CALL_SHEET_LIMIT = 20
 
 WINDOW_SIZE = "1100x700"
 
@@ -118,6 +121,7 @@ class App(ttk.Frame):
 
         self._build_top_bar()
         self._build_main_area()
+        self._build_export_bar()
         self._build_status_bar()
 
         self.root.after(100, self._poll_queue)
@@ -269,9 +273,17 @@ class App(ttk.Frame):
         self.detail_reasons_text.grid(row=9, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
         detail.grid_rowconfigure(9, weight=1)
 
-    def _build_status_bar(self) -> None:
+    def _build_export_bar(self) -> None:
         bar = ttk.Frame(self, padding=(8, 4))
         bar.grid(row=2, column=0, sticky="ew")
+        ttk.Button(bar, text="Export CSV", command=self._on_export_csv_clicked).pack(side="left")
+        ttk.Button(
+            bar, text="Copy as Call Sheet", command=self._on_copy_call_sheet_clicked
+        ).pack(side="left", padx=(6, 0))
+
+    def _build_status_bar(self) -> None:
+        bar = ttk.Frame(self, padding=(8, 4))
+        bar.grid(row=3, column=0, sticky="ew")
 
         self.status_var = tk.StringVar(value="Ready.")
         ttk.Label(bar, textvariable=self.status_var, anchor="w").pack(side="left", fill="x", expand=True)
@@ -366,7 +378,46 @@ class App(ttk.Frame):
         self.detail_reasons_text.insert("end", f"{result.tier}  (score {result.score})\n\n")
         for reason in result.reasons:
             self.detail_reasons_text.insert("end", f"• {reason}\n")
+        if result.flags:
+            self.detail_reasons_text.insert("end", "\nNotes (not a judgment, just a signal):\n")
+            for flag in result.flags:
+                self.detail_reasons_text.insert("end", f"• {flag}\n")
         self.detail_reasons_text.configure(state="disabled")
+
+    # -- export -------------------------------------------------
+
+    def _ordered_rows(self) -> list[tuple[Business, ScoreResult]]:
+        """Rows in whatever order the table is currently sorted/displayed in."""
+        return [self.rows[iid] for iid in self.tree.get_children("")]
+
+    def _on_export_csv_clicked(self) -> None:
+        rows = self._ordered_rows()
+        if not rows:
+            messagebox.showinfo("Local Lead Finder", "Run a search first — there's nothing to export yet.")
+            return
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile="leads.csv",
+        )
+        if not path:
+            return
+
+        count = export.write_csv(path, rows)
+        self.status_var.set(f"Exported {count} leads to {path}")
+
+    def _on_copy_call_sheet_clicked(self) -> None:
+        rows = self._ordered_rows()
+        if not rows:
+            messagebox.showinfo("Local Lead Finder", "Run a search first — there's nothing to copy yet.")
+            return
+
+        call_sheet = export.build_call_sheet(rows, limit=CALL_SHEET_LIMIT)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(call_sheet)
+        self.root.update()  # required for the clipboard to actually retain the text
+        self.status_var.set(f"Copied top {CALL_SHEET_LIMIT} callable leads to the clipboard.")
 
     # -- search lifecycle -------------------------------------------
 

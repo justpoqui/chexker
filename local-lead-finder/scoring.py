@@ -137,6 +137,7 @@ class ScoreResult:
     tier: str
     score: int
     reasons: list[str] = field(default_factory=list)
+    flags: list[str] = field(default_factory=list)
 
 
 # ============================================================
@@ -198,10 +199,9 @@ def score_business(
         score += PHONE_BONUS
         reasons.append(f"+{PHONE_BONUS}: has a phone number.")
 
-    if enrichment and enrichment.flags:
-        reasons.extend(f"Note: {flag}" for flag in enrichment.flags)
+    flags = list(enrichment.flags) if enrichment else []
 
-    return ScoreResult(tier=tier, score=score, reasons=reasons)
+    return ScoreResult(tier=tier, score=score, reasons=reasons, flags=flags)
 
 
 # ============================================================
@@ -265,4 +265,4 @@ if __name__ == "__main__":
 
     for label, business, enrichment in cases:
         result = score_business(business, enrichment)
-        print(f"{label:38s} -> {result.tier:15s} score={result.score:3d}  {result.reasons}")
+        print(f"{label:38s} -> {result.tier:15s} score={result.score:3d}  {result.reasons}  flags={result.flags}")
