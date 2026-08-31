@@ -100,6 +100,68 @@ class _AreaPickerDialog(tk.Toplevel):
 
 
 # ============================================================
+# STEP 8 — ABOUT BOX
+# WHY: the OSM/ODbL license requires attribution wherever this
+#      data is displayed, and honesty about the app's limits (OSM's
+#      uneven coverage, never judging a Facebook page's activity)
+#      belongs somewhere a user will actually see it — not just
+#      buried in the README.
+# ============================================================
+
+def _make_link_label(parent: tk.Widget, text: str, url: str) -> tk.Label:
+    label = tk.Label(parent, text=text, fg="blue", cursor="hand2", wraplength=380, justify="left")
+    label.bind("<Button-1>", lambda event: webbrowser.open(url))
+    return label
+
+
+class _AboutDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Tk):
+        super().__init__(parent)
+        self.title("About Local Lead Finder")
+        self.resizable(False, False)
+
+        frame = ttk.Frame(self, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="Local Lead Finder", font=("", 13, "bold")).pack(anchor="w")
+        ttk.Label(
+            frame,
+            text="Finds businesses with weak or missing web presence, so you can "
+                 "pitch them web/marketing work.",
+            wraplength=380, justify="left",
+        ).pack(anchor="w", pady=(2, 12))
+
+        ttk.Label(
+            frame,
+            text="Business data © OpenStreetMap contributors, licensed under the "
+                 "Open Database License (ODbL):",
+            wraplength=380, justify="left",
+        ).pack(anchor="w")
+        _make_link_label(
+            frame, "https://www.openstreetmap.org/copyright", "https://www.openstreetmap.org/copyright"
+        ).pack(anchor="w", pady=(0, 12))
+
+        ttk.Label(
+            frame,
+            text='OSM coverage is uneven. A "no website" result is a hypothesis to '
+                 "verify by hand, not a fact.",
+            wraplength=380, justify="left",
+        ).pack(anchor="w", pady=(0, 12))
+
+        ttk.Label(
+            frame,
+            text="This app never determines whether a Facebook page is active or "
+                 "abandoned — that judgment call is yours, made by clicking the link.",
+            wraplength=380, justify="left",
+        ).pack(anchor="w", pady=(0, 12))
+
+        ttk.Button(frame, text="OK", command=self.destroy).pack(anchor="e")
+
+        self.transient(parent)
+        self.grab_set()
+
+
+# ============================================================
 # STEP 6 — MAIN APPLICATION WINDOW
 # ============================================================
 
@@ -119,6 +181,7 @@ class App(ttk.Frame):
         self.worker_thread: Optional[threading.Thread] = None
         self.cancel_event = threading.Event()
 
+        self._build_menu_bar()
         self._build_top_bar()
         self._build_main_area()
         self._build_export_bar()
@@ -127,6 +190,13 @@ class App(ttk.Frame):
         self.root.after(100, self._poll_queue)
 
     # -- layout -------------------------------------------------
+
+    def _build_menu_bar(self) -> None:
+        menu_bar = tk.Menu(self.root)
+        help_menu = tk.Menu(menu_bar, tearoff=0)
+        help_menu.add_command(label="About Local Lead Finder", command=lambda: _AboutDialog(self.root))
+        menu_bar.add_cascade(label="Help", menu=help_menu)
+        self.root.config(menu=menu_bar)
 
     def _build_top_bar(self) -> None:
         bar = ttk.Frame(self, padding=8)

@@ -13,10 +13,9 @@ one; judging whether that page is still active is left to you.
 
 ## Status
 
-This is the project scaffold (Step 1 of the build). Every module below exists
-as a file with a docstring-style outline of what it will do and which step
-builds it — there is no working logic yet. Run `python main.py` and you'll
-just see a placeholder message printed to the terminal.
+All seven build steps are done: area resolution, the Overpass business
+query, lead scoring, website enrichment, the Tkinter GUI, and CSV/call-sheet
+export are all working. Run `python main.py` to launch the real app.
 
 ## Requirements
 
@@ -37,9 +36,10 @@ python main.py
   business logic here.
 
 - **`gui.py`** — All Tkinter widget code: the search bar, the sortable
-  results table, the detail panel for a selected business, the status bar,
-  and the background-thread-to-UI bridge (a `queue.Queue` polled with
-  `after()` so network calls never freeze the window).
+  results table, the detail panel for a selected business, the export
+  buttons, the status bar, an About box (Help menu), and the
+  background-thread-to-UI bridge (a `queue.Queue` polled with `after()` so
+  network calls never freeze the window).
 
 - **`osm_source.py`** — The only module allowed to talk to the Overpass API.
   Resolves a search area (either a named place OSM already knows, or a
