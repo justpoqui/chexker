@@ -41,6 +41,22 @@ TIER_COLORS = {
     "HEALTHY": "#c8f0c8",
     "CHAIN": "#d9d9d9",  # deliberately outside the warm-to-cool gradient — not a lead at all
 }
+TIER_LABELS = {
+    "NO_PRESENCE": "No presence",
+    "FACEBOOK_ONLY": "Facebook only",
+    "SOCIAL_ONLY": "Social only",
+    "SITE_NO_SOCIAL": "Site, no social",
+    "WEAK_SITE": "Weak site",
+    "HEALTHY": "Healthy",
+    "CHAIN": "Chain",
+}
+
+# How long to wait after the last keystroke in the results-filter box before
+# re-filtering the table, so typing doesn't re-walk every row on every
+# keystroke — a search that resolves to a huge area (a whole state, or
+# several picker candidates at once) can return hundreds of thousands of
+# businesses, and Tkinter's Treeview is not fast at that scale.
+NAME_FILTER_DEBOUNCE_MS = 300
 
 COLUMNS = ("score", "tier", "new", "status", "name", "category", "phone", "web", "address", "edited")
 COLUMN_HEADINGS = {
@@ -216,6 +232,20 @@ class App(ttk.Frame):
         self.lead_info: dict[str, dict] = self.cache.get_all_leads()
         self.hide_contacted_var = tk.BooleanVar(value=False)
 
+        # Results-table filters (separate from the search-time category
+        # toggles in the top bar): a wide-area search can return far more
+        # businesses than are useful to look at, so these narrow the table
+        # after the fact rather than requiring a narrower search up front.
+        self.name_filter_var = tk.StringVar(value="")
+        self._name_filter_after_id: Optional[str] = None
+        self.tier_filter_vars: dict[str, tk.BooleanVar] = {
+            tier: tk.BooleanVar(value=True) for tier in TIER_COLORS
+        }
+        self.visible_count_var = tk.StringVar(value="0 / 0 shown")
+        self._visible_count = 0  # kept in sync incrementally -- see _insert_or_update_row;
+        # recomputing via len(self.tree.get_children()) after every row would be
+        # O(n^2) once a search returns tens of thousands of businesses.
+
         self.result_queue: "queue.Queue" = queue.Queue()
         self.worker_thread: Optional[threading.Thread] = None
         self.cancel_event = threading.Event()
@@ -342,8 +372,32 @@ class App(ttk.Frame):
         # -- results table --
         table_frame = ttk.Frame(main)
         table_frame.grid(row=0, column=0, sticky="nsew")
-        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_rowconfigure(1, weight=1)
         table_frame.grid_columnconfigure(0, weight=1)
+
+        # -- results filter bar: narrows the table *after* a search, since
+        #    a wide-enough area (a whole state, or several picker
+        #    candidates searched at once) can return far more businesses
+        #    than are useful to scroll through at once --
+        filter_bar = ttk.Frame(table_frame)
+        filter_bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+
+        ttk.Label(filter_bar, text="Filter name:").pack(side="left")
+        ttk.Entry(filter_bar, textvariable=self.name_filter_var, width=20).pack(
+            side="left", padx=(4, 12)
+        )
+        self.name_filter_var.trace_add("write", self._on_name_filter_changed)
+
+        ttk.Label(filter_bar, text="Tier:").pack(side="left")
+        for tier in TIER_COLORS:
+            ttk.Checkbutton(
+                filter_bar, text=TIER_LABELS[tier], variable=self.tier_filter_vars[tier],
+                command=self._refresh_table_visibility,
+            ).pack(side="left", padx=2)
+
+        ttk.Label(filter_bar, textvariable=self.visible_count_var, anchor="e").pack(
+            side="right", padx=(12, 0)
+        )
 
         self.tree = ttk.Treeview(table_frame, columns=COLUMNS, show="headings")
         for col in COLUMNS:
@@ -352,11 +406,11 @@ class App(ttk.Frame):
             self.tree.column(col, width=width, anchor="w")
         for tier, color in TIER_COLORS.items():
             self.tree.tag_configure(tier, background=color)
-        self.tree.grid(row=0, column=0, sticky="nsew")
+        self.tree.grid(row=1, column=0, sticky="nsew")
 
         scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
-        scrollbar.grid(row=0, column=1, sticky="ns")
+        scrollbar.grid(row=1, column=1, sticky="ns")
 
         self.tree.bind("<<TreeviewSelect>>", self._on_row_selected)
 
@@ -512,29 +566,64 @@ class App(ttk.Frame):
     def _lead_status(self, osm_key: str) -> str:
         return self.lead_info.get(osm_key, {}).get("status", "new")
 
+    def _row_hidden(self, business: Business, result: ScoreResult) -> bool:
+        """Whether the results-table filters currently hide this business --
+        "Hide already contacted", the tier checkboxes, and the name filter
+        all apply here so a huge search (a whole state, or several picker
+        candidates searched together) doesn't have to be re-run narrower
+        just to be usable."""
+        if self.hide_contacted_var.get() and self._lead_status(business.osm_key) != "new":
+            return True
+        if not self.tier_filter_vars[result.tier].get():
+            return True
+        name_filter = self.name_filter_var.get().strip().lower()
+        if name_filter and name_filter not in business.name.lower():
+            return True
+        return False
+
     def _insert_or_update_row(self, business: Business, result: ScoreResult) -> None:
-        """Update the data model, then reflect it in the tree — but only insert
-        a tree row if it isn't currently hidden by the "Hide already
-        contacted" filter."""
+        """Update the data model, then reflect it in the tree — but only
+        insert a tree row if it isn't currently hidden by the results
+        filters (see _row_hidden). Tracks self._visible_count incrementally
+        rather than re-deriving it from len(self.tree.get_children()) on
+        every call, which would turn a full filter refresh over tens of
+        thousands of rows into an O(n^2) operation."""
         osm_key = business.osm_key
         self.rows[osm_key] = (business, result)
+        exists_in_tree = self.tree.exists(osm_key)
 
-        hidden = self.hide_contacted_var.get() and self._lead_status(osm_key) != "new"
-        if hidden:
-            if self.tree.exists(osm_key):
+        if self._row_hidden(business, result):
+            if exists_in_tree:
                 self.tree.delete(osm_key)
+                self._visible_count -= 1
+                self._update_visible_count_label()
             return
 
         values = self._row_values(business, result)
-        if self.tree.exists(osm_key):
+        if exists_in_tree:
             self.tree.item(osm_key, values=values, tags=(result.tier,))
         else:
             self.tree.insert("", "end", iid=osm_key, values=values, tags=(result.tier,))
+            self._visible_count += 1
+            self._update_visible_count_label()
+
+    def _update_visible_count_label(self) -> None:
+        self.visible_count_var.set(f"{self._visible_count} / {len(self.rows)} shown")
+
+    def _on_name_filter_changed(self, *_args) -> None:
+        # Debounced: re-filtering the whole table on every keystroke is
+        # noticeably laggy once there are tens of thousands of rows.
+        if self._name_filter_after_id is not None:
+            self.root.after_cancel(self._name_filter_after_id)
+        self._name_filter_after_id = self.root.after(
+            NAME_FILTER_DEBOUNCE_MS, self._refresh_table_visibility
+        )
 
     def _refresh_table_visibility(self) -> None:
         """Re-derive which rows the tree shows from self.rows + the current
-        filter state — called when the filter checkbox is toggled, or after
-        a lead's status changes."""
+        filter state — called when a filter changes, or after a lead's
+        status changes."""
+        self._name_filter_after_id = None
         for business, result in list(self.rows.values()):
             self._insert_or_update_row(business, result)
 
@@ -690,6 +779,8 @@ class App(ttk.Frame):
 
         self.tree.delete(*self.tree.get_children())
         self.rows.clear()
+        self._visible_count = 0
+        self.visible_count_var.set("0 / 0 shown")
         self._selected_osm_key = None
         self.save_lead_button.configure(state="disabled")
         self._cache_hits = 0
