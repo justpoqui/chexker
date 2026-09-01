@@ -98,7 +98,7 @@ class SearchArea:
     radius_m: Optional[float] = None
 
 
-PickerFn = Callable[[list[AreaCandidate]], Optional[AreaCandidate]]
+PickerFn = Callable[[list[AreaCandidate]], list[AreaCandidate]]
 
 
 # ============================================================
@@ -328,15 +328,17 @@ def find_named_area_candidates(
     return candidates
 
 
-def terminal_picker(candidates: list[AreaCandidate]) -> Optional[AreaCandidate]:
+def terminal_picker(candidates: list[AreaCandidate]) -> list[AreaCandidate]:
     """A no-GUI picker for testing this module from the command line."""
     print(f"Found {len(candidates)} places with that name:")
     for i, candidate in enumerate(candidates, start=1):
         print(f"  {i}. {candidate}")
-    choice = input("Pick one (number), or blank to cancel: ").strip()
+    choice = input(
+        "Pick one or more (comma-separated numbers), or blank to cancel: "
+    ).strip()
     if not choice:
-        return None
-    return candidates[int(choice) - 1]
+        return []
+    return [candidates[int(part.strip()) - 1] for part in choice.split(",") if part.strip()]
 
 
 def _candidate_in_state(
@@ -377,8 +379,13 @@ def resolve_named_area(
     state_name: Optional[str] = None,
     state_iso: Optional[str] = None,
     point_radius_miles: float = 5.0,
-) -> Optional[SearchArea]:
-    """Resolve a place name to a SearchArea, prompting `picker` on ambiguity.
+) -> list[SearchArea]:
+    """Resolve a place name to one or more SearchAreas, prompting `picker`
+    on ambiguity. `picker` can return more than one candidate — e.g. OSM
+    carries both a boundary and a separate place=* node for the same real
+    place, or two genuinely different nearby places share a name — in
+    which case every chosen candidate is searched and the caller (see
+    search_businesses_multi()) merges the results.
 
     `state_name`/`state_iso` (e.g. "Florida"/"US-FL", from the GUI's
     optional state dropdown) narrow an ambiguous name down to one state,
@@ -390,12 +397,12 @@ def resolve_named_area(
     radius search centered on it instead of an area(id:...) search, since
     there's no polygon to search within.
 
-    Returns None if no matches were found, or if the picker returned None
-    (the user cancelled).
+    Returns an empty list if no matches were found, or if the picker
+    returned none (the user cancelled).
     """
     candidates = find_named_area_candidates(name, cache, status_cb)
     if not candidates:
-        return None
+        return []
 
     if state_name:
         status_cb(f"Narrowing {len(candidates)} match(es) to {state_name}...")
@@ -411,7 +418,7 @@ def resolve_named_area(
             candidates = filtered
 
     if len(candidates) == 1:
-        chosen = candidates[0]
+        chosen_candidates = candidates
     else:
         # Only names that actually collide reach here, so it's worth a
         # Nominatim reverse-geocode call per undisambiguated candidate to
@@ -423,15 +430,18 @@ def resolve_named_area(
             label = _reverse_geocode_label(candidate.lat, candidate.lon, cache)
             candidate.detail = label or f"≈{candidate.lat:.2f}, {candidate.lon:.2f}"
 
-        chosen = (picker or terminal_picker)(candidates)
-        if chosen is None:
-            return None
+        chosen_candidates = (picker or terminal_picker)(candidates)
+        if not chosen_candidates:
+            return []
 
-    if chosen.osm_type == "node":
-        label = f"{point_radius_miles:g} mi around {chosen}"
-        return make_radius_area(chosen.lat, chosen.lon, point_radius_miles, label=label)
-
-    return SearchArea(mode="named", label=str(chosen), area_id=chosen.area_id)
+    areas = []
+    for chosen in chosen_candidates:
+        if chosen.osm_type == "node":
+            label = f"{point_radius_miles:g} mi around {chosen}"
+            areas.append(make_radius_area(chosen.lat, chosen.lon, point_radius_miles, label=label))
+        else:
+            areas.append(SearchArea(mode="named", label=str(chosen), area_id=chosen.area_id))
+    return areas
 
 
 # ============================================================
@@ -597,6 +607,27 @@ def search_businesses(
     return businesses
 
 
+def search_businesses_multi(
+    areas: list[SearchArea],
+    category_keys,
+    cache: Cache,
+    status_cb: Callable[[str], None] = lambda msg: None,
+) -> list[Business]:
+    """Run search_businesses() over every area — resolve_named_area() can
+    return more than one when its picker selects multiple candidates — and
+    merge the results, de-duplicating by osm_key since overlapping areas
+    can easily surface the same business twice."""
+    seen: set[str] = set()
+    merged: list[Business] = []
+    for area in areas:
+        for business in search_businesses(area, category_keys, cache, status_cb):
+            if business.osm_key in seen:
+                continue
+            seen.add(business.osm_key)
+            merged.append(business)
+    return merged
+
+
 # ============================================================
 # STEP 2/16 — NOMINATIM GEOCODING
 # WHY: turning a typed address or ZIP/postal code into lat/lon
@@ -733,13 +764,14 @@ if __name__ == "__main__":
 
     elif len(sys.argv) >= 2 and sys.argv[1] == "businesses":
         _, _, place_name, *category_keys = sys.argv
-        area = resolve_named_area(place_name, cache, status_cb=print)
-        if area is None:
+        areas = resolve_named_area(place_name, cache, status_cb=print)
+        if not areas:
             print("No match found (or selection cancelled).")
         else:
-            print(f"Searching {area.label} ...")
-            businesses = search_businesses(
-                area, category_keys or ALL_CATEGORY_KEYS, cache, status_cb=print
+            for area in areas:
+                print(f"Searching {area.label} ...")
+            businesses = search_businesses_multi(
+                areas, category_keys or ALL_CATEGORY_KEYS, cache, status_cb=print
             )
             for business in businesses[:20]:
                 print(
@@ -750,8 +782,12 @@ if __name__ == "__main__":
 
     elif len(sys.argv) >= 2:
         place_name = " ".join(sys.argv[1:])
-        area = resolve_named_area(place_name, cache, status_cb=print)
-        print(area if area else "No match found (or selection cancelled).")
+        areas = resolve_named_area(place_name, cache, status_cb=print)
+        if not areas:
+            print("No match found (or selection cancelled).")
+        else:
+            for area in areas:
+                print(area)
 
     else:
         print("Usage:")

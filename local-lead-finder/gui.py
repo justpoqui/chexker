@@ -90,14 +90,23 @@ class _AreaPickerDialog(tk.Toplevel):
         super().__init__(parent)
         self.title("Multiple matches found")
         self.resizable(False, False)
-        self.choice: Optional[AreaCandidate] = None
+        self.choice: list[AreaCandidate] = []
         self._candidates = candidates
 
-        ttk.Label(self, text="Several places match that name — pick one:").pack(
-            padx=12, pady=(12, 6)
-        )
+        # Some names genuinely have more than one real match worth
+        # searching (a boundary and a separate place=* node for the same
+        # town, or two nearby places that share a name) -- Ctrl/Shift-click
+        # selects more than one row, same as any other multi-select list.
+        ttk.Label(
+            self,
+            text="Several places match that name — pick one, or Ctrl/Shift-click "
+                 "to search more than one:",
+            wraplength=380, justify="left",
+        ).pack(padx=12, pady=(12, 6))
 
-        self.listbox = tk.Listbox(self, width=64, height=min(10, len(candidates)))
+        self.listbox = tk.Listbox(
+            self, width=64, height=min(10, len(candidates)), selectmode=tk.EXTENDED
+        )
         for candidate in candidates:
             self.listbox.insert("end", str(candidate))
         self.listbox.selection_set(0)
@@ -114,13 +123,11 @@ class _AreaPickerDialog(tk.Toplevel):
         self.grab_set()
 
     def _on_ok(self) -> None:
-        selection = self.listbox.curselection()
-        if selection:
-            self.choice = self._candidates[selection[0]]
+        self.choice = [self._candidates[i] for i in self.listbox.curselection()]
         self.destroy()
 
     def _on_cancel(self) -> None:
-        self.choice = None
+        self.choice = []
         self.destroy()
 
 
@@ -704,24 +711,24 @@ class App(ttk.Frame):
     def _status_cb(self, message: str) -> None:
         self.result_queue.put(("status", message))
 
-    def _gui_picker(self, candidates: list[AreaCandidate]) -> Optional[AreaCandidate]:
+    def _gui_picker(self, candidates: list[AreaCandidate]) -> list[AreaCandidate]:
         """Runs on the background thread; blocks it until the main thread's
         _handle_pick_area() has shown the dialog and recorded a choice."""
         result_holder: dict = {}
         done_event = threading.Event()
         self.result_queue.put(("pick_area", candidates, result_holder, done_event))
         done_event.wait()
-        return result_holder.get("choice")
+        return result_holder.get("choice", [])
 
     def _run_search(self, params: dict, category_keys: list[str]) -> None:
         try:
             if params["mode"] == "named":
-                area = osm_source.resolve_named_area(
+                areas = osm_source.resolve_named_area(
                     params["area_name"], self.cache, picker=self._gui_picker,
                     status_cb=self._status_cb, state_name=params.get("state_name"),
                     state_iso=params.get("state_iso"), point_radius_miles=params.get("radius", 5.0),
                 )
-                if area is None:
+                if not areas:
                     self.result_queue.put(("error", f'No match found for "{params["area_name"]}".'))
                     return
             elif params["mode"] == "zip":
@@ -734,16 +741,21 @@ class App(ttk.Frame):
                     return
                 lat, lon = center
                 label = f"{params['radius']:g} mi around ZIP {params['zip_code']}"
-                area = osm_source.make_radius_area(lat, lon, params["radius"], label=label)
+                areas = [osm_source.make_radius_area(lat, lon, params["radius"], label=label)]
             else:  # "radius"
-                area = osm_source.make_radius_area(params["lat"], params["lon"], params["radius"])
+                areas = [osm_source.make_radius_area(params["lat"], params["lon"], params["radius"])]
 
             if self.cancel_event.is_set():
                 self.result_queue.put(("cancelled", None))
                 return
 
-            businesses = osm_source.search_businesses(
-                area, category_keys, self.cache, status_cb=self._status_cb
+            # A named-area search can now resolve to more than one area (the
+            # picker's Ctrl/Shift-click multi-select — see
+            # _AreaPickerDialog); every other mode always yields exactly
+            # one, so this covers all three uniformly.
+            area_label = "; ".join(area.label for area in areas)
+            businesses = osm_source.search_businesses_multi(
+                areas, category_keys, self.cache, status_cb=self._status_cb
             )
 
             if self.cancel_event.is_set():
@@ -769,7 +781,7 @@ class App(ttk.Frame):
             # re-running the same city with the same category toggles diffs
             # against last time, but broadening the categories doesn't
             # falsely flag everything the wider search adds as "new".
-            snapshot_key = f"{area.label}|{','.join(sorted(category_keys))}"
+            snapshot_key = f"{area_label}|{','.join(sorted(category_keys))}"
             previous_snapshot = self.cache.get_snapshot(snapshot_key)
             current_keys = {business.osm_key for business in businesses}
             self.cache.set_snapshot(snapshot_key, current_keys)
