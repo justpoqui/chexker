@@ -91,6 +91,15 @@ class Cache:
                 )
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    snapshot_key TEXT PRIMARY KEY,
+                    osm_keys_json TEXT NOT NULL,
+                    run_at        REAL NOT NULL
+                )
+                """
+            )
 
     # -- Overpass response cache -----------------------------------
 
@@ -245,6 +254,38 @@ class Cache:
                     updated_at = excluded.updated_at
                 """,
                 (osm_key, status, touched_now, notes),
+            )
+
+    # ============================================================
+    # STEP 15 — DIFF MODE: remembering the last run of each search
+    # WHY: only the most recent snapshot per search is needed to
+    #      answer "what's new since last time" — this deliberately
+    #      isn't a full history log, just enough to diff against.
+    #      Like `leads`, this is overwritten by the app itself, not
+    #      re-fetched from an outside source, so it has no TTL.
+    # ============================================================
+
+    def get_snapshot(self, snapshot_key: str) -> Optional[set[str]]:
+        """The osm_keys seen the last time this exact search ran, or None
+        if it has never run before (nothing to diff against yet)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT osm_keys_json FROM snapshots WHERE snapshot_key = ?",
+                (snapshot_key,),
+            ).fetchone()
+        return set(json.loads(row[0])) if row else None
+
+    def set_snapshot(self, snapshot_key: str, osm_keys: set[str]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO snapshots (snapshot_key, osm_keys_json, run_at)
+                VALUES (?, ?, strftime('%s', 'now'))
+                ON CONFLICT(snapshot_key) DO UPDATE SET
+                    osm_keys_json = excluded.osm_keys_json,
+                    run_at = excluded.run_at
+                """,
+                (snapshot_key, json.dumps(sorted(osm_keys))),
             )
 
     def close(self) -> None:

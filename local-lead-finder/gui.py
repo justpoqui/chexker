@@ -39,10 +39,11 @@ TIER_COLORS = {
     "CHAIN": "#d9d9d9",  # deliberately outside the warm-to-cool gradient — not a lead at all
 }
 
-COLUMNS = ("score", "tier", "status", "name", "category", "phone", "web", "address", "edited")
+COLUMNS = ("score", "tier", "new", "status", "name", "category", "phone", "web", "address", "edited")
 COLUMN_HEADINGS = {
     "score": "Score",
     "tier": "Tier",
+    "new": "New?",
     "status": "Status",
     "name": "Name",
     "category": "Category",
@@ -310,7 +311,7 @@ class App(ttk.Frame):
         self.tree = ttk.Treeview(table_frame, columns=COLUMNS, show="headings")
         for col in COLUMNS:
             self.tree.heading(col, text=COLUMN_HEADINGS[col], command=lambda c=col: self._sort_by(c))
-            width = 70 if col == "score" else 130 if col in ("tier", "phone", "status", "edited") else 200
+            width = 55 if col == "new" else 70 if col == "score" else 130 if col in ("tier", "phone", "status", "edited") else 200
             self.tree.column(col, width=width, anchor="w")
         for tier, color in TIER_COLORS.items():
             self.tree.tag_configure(tier, background=color)
@@ -447,6 +448,7 @@ class App(ttk.Frame):
         return (
             result.score,
             result.tier,
+            "★ New" if result.is_new else "—",
             LEAD_STATUS_LABELS[status],
             business.name,
             f"{business.category_key}={business.category_value}",
@@ -690,8 +692,31 @@ class App(ttk.Frame):
                 for business in businesses
             }
 
+            # Diff mode (STEP 15): "this exact search" is identified by the
+            # resolved area's label plus which categories were searched, so
+            # re-running the same city with the same category toggles diffs
+            # against last time, but broadening the categories doesn't
+            # falsely flag everything the wider search adds as "new".
+            snapshot_key = f"{area.label}|{','.join(sorted(category_keys))}"
+            previous_snapshot = self.cache.get_snapshot(snapshot_key)
+            current_keys = {business.osm_key for business in businesses}
+            self.cache.set_snapshot(snapshot_key, current_keys)
+            is_new_map = {
+                business.osm_key: previous_snapshot is not None and business.osm_key not in previous_snapshot
+                for business in businesses
+            }
+            if previous_snapshot is not None:
+                new_count = sum(is_new_map.values())
+                self._status_cb(f"{new_count} business(es) new since your last search here.")
+
             initial_rows = [
-                (business, scoring.score_business(business, None, chain_reasons[business.osm_key]))
+                (
+                    business,
+                    scoring.score_business(
+                        business, None, chain_reasons[business.osm_key],
+                        is_new_since_last_run=is_new_map[business.osm_key],
+                    ),
+                )
                 for business in businesses
             ]
             self.result_queue.put(("initial_results", initial_rows))
@@ -711,7 +736,8 @@ class App(ttk.Frame):
                 hits = precall_hits.get(business.osm_key)
                 if hits:
                     result = scoring.score_business(
-                        business, None, chain_reasons[business.osm_key], hits
+                        business, None, chain_reasons[business.osm_key], hits,
+                        is_new_since_last_run=is_new_map[business.osm_key],
                     )
                     self.result_queue.put(("row_update", business, result))
 
@@ -723,6 +749,7 @@ class App(ttk.Frame):
                 result = scoring.score_business(
                     business, enrichment, chain_reasons[business.osm_key],
                     precall_hits.get(business.osm_key),
+                    is_new_since_last_run=is_new_map[business.osm_key],
                 )
                 self.result_queue.put(("row_update", business, result))
 

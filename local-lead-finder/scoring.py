@@ -55,6 +55,13 @@ PHONE_BONUS = 15
 # manual check before calling — see enrich.precall_check_businesses().
 PRECALL_HIT_PENALTY = 30
 
+# STEP 15 — a business that wasn't in this exact search's previous
+# snapshot is very likely newly opened (or newly mapped) -- the single
+# warmest lead category, since a brand-new business hasn't hired anyone
+# for its web presence yet. Doesn't apply to CHAIN: a new franchise
+# location is still not worth pursuing regardless of how new it is.
+NEW_SINCE_LAST_RUN_BONUS = 20
+
 
 # ============================================================
 # STEP 11 — CHAIN / FRANCHISE DETECTION
@@ -221,6 +228,7 @@ class ScoreResult:
     score: int
     reasons: list[str] = field(default_factory=list)
     flags: list[str] = field(default_factory=list)
+    is_new: bool = False
 
 
 # ============================================================
@@ -232,6 +240,7 @@ def score_business(
     enrichment: Optional[EnrichmentResult] = None,
     chain_reason: Optional[str] = None,
     precall_hits: Optional[list[str]] = None,
+    is_new_since_last_run: bool = False,
 ) -> ScoreResult:
     """Classify one Business into a tier and score.
 
@@ -252,9 +261,20 @@ def score_business(
     OSM says has no website. That doesn't confirm the domain is really
     theirs, so it doesn't change the tier — but it's demoted and flagged
     for a manual look before anyone dials the phone.
+
+    `is_new_since_last_run`, when True, means this business's osm_key
+    wasn't in this exact search's previous snapshot (STEP 15) — likely a
+    newly opened or newly mapped business, and thus an especially warm
+    lead regardless of tier (chains excepted).
     """
     if chain_reason:
-        return ScoreResult(tier="CHAIN", score=TIER_BASE_SCORES["CHAIN"], reasons=[chain_reason])
+        # is_new is still recorded factually (a new chain location is still
+        # new), it just earns no score bonus -- corporate owns the presence
+        # either way, so newness doesn't make it more of a sales opportunity.
+        return ScoreResult(
+            tier="CHAIN", score=TIER_BASE_SCORES["CHAIN"], reasons=[chain_reason],
+            is_new=is_new_since_last_run,
+        )
 
     reasons: list[str] = []
     has_social_tag = bool(business.facebook or business.instagram)
@@ -315,9 +335,18 @@ def score_business(
             "Might not be theirs, but check by hand before assuming no website exists."
         )
 
+    if is_new_since_last_run:
+        score += NEW_SINCE_LAST_RUN_BONUS
+        reasons.append(
+            f"+{NEW_SINCE_LAST_RUN_BONUS}: NEW since your last search here — "
+            "likely a recently opened business that hasn't hired anyone for its web presence yet."
+        )
+
     flags = list(enrichment.flags) if enrichment else []
 
-    return ScoreResult(tier=tier, score=score, reasons=reasons, flags=flags)
+    return ScoreResult(
+        tier=tier, score=score, reasons=reasons, flags=flags, is_new=is_new_since_last_run
+    )
 
 
 # ============================================================
@@ -428,5 +457,22 @@ if __name__ == "__main__":
     print(f"no DNS hit        -> {clean_result.tier:12s} score={clean_result.score:3d}  {clean_result.reasons}")
     assert suspect_result.score == clean_result.score - PRECALL_HIT_PENALTY
     assert suspect_result.tier == "NO_PRESENCE"  # demoted in score, not reclassified
+
+    print("\n--- new-since-last-run bonus ---")
+    new_biz = make_business(name="Brand New Diner")
+    old_biz = make_business(name="Same As Last Time Diner")
+    new_result = score_business(new_biz, is_new_since_last_run=True)
+    old_result = score_business(old_biz, is_new_since_last_run=False)
+    print(f"new since last run -> {new_result.tier:12s} score={new_result.score:3d}  is_new={new_result.is_new}  {new_result.reasons}")
+    print(f"seen before         -> {old_result.tier:12s} score={old_result.score:3d}  is_new={old_result.is_new}")
+    assert new_result.score == old_result.score + NEW_SINCE_LAST_RUN_BONUS
+    assert new_result.is_new and not old_result.is_new
+
+    # a new CHAIN location is recorded as new but gets no score bonus
+    new_chain = make_business(name="Subway", raw_tags={"brand": "Subway"})
+    new_chain_result = score_business(new_chain, chain_reason="Tagged as a chain in OSM (brand=Subway).", is_new_since_last_run=True)
+    print(f"new chain location  -> {new_chain_result.tier:12s} score={new_chain_result.score:3d}  is_new={new_chain_result.is_new}")
+    assert new_chain_result.score == TIER_BASE_SCORES["CHAIN"]  # no bonus applied
+    assert new_chain_result.is_new  # but still factually flagged as new
 
     print("\nALL OK")
