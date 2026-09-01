@@ -29,11 +29,11 @@ OVERPASS_ENDPOINTS = (
 USER_AGENT = "LocalLeadFinder/1.0 (personal lead research)"
 
 # Nominatim asks that the User-Agent identify the actual application and,
-# ideally, a way to contact its operator. Edit the contact detail below to
-# your own address before enabling the optional geocoder in the GUI.
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+# ideally, a way to contact its operator.
+NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 NOMINATIM_USER_AGENT = (
-    "LocalLeadFinder/1.0 (personal lead research; contact: set-your-email@example.com)"
+    "LocalLeadFinder/1.0 (personal lead research; contact: mardarv96@gmail.com)"
 )
 NOMINATIM_MIN_INTERVAL_SECONDS = 1.1  # policy requires "at most 1 request/second"
 
@@ -242,11 +242,10 @@ def find_named_area_candidates(
             if tags.get(key)
         ]
         detail = ", ".join(dict.fromkeys(detail_parts))
-        if not detail and lat is not None and lon is not None:
-            # Last resort: nothing in OSM's tags disambiguates this one, but
-            # a rough coordinate at least lets a human recognize "that's the
-            # Florida one" from the picker instead of seeing identical rows.
-            detail = f"≈{lat:.2f}, {lon:.2f}"
+        # If OSM's own tags don't disambiguate, resolve_named_area() below
+        # fills `detail` in via reverse geocoding once it knows whether this
+        # name is actually ambiguous (no point spending a Nominatim call on
+        # every single-match search).
 
         candidates.append(
             AreaCandidate(
@@ -291,6 +290,16 @@ def resolve_named_area(
     if len(candidates) == 1:
         chosen = candidates[0]
     else:
+        # Only names that actually collide reach here, so it's worth a
+        # Nominatim reverse-geocode call per undisambiguated candidate to
+        # show a real "Hillsborough County, FL" instead of raw coordinates.
+        for candidate in candidates:
+            if candidate.detail or candidate.lat is None or candidate.lon is None:
+                continue
+            status_cb(f"Looking up {candidate.name}'s location to tell it apart...")
+            label = _reverse_geocode_label(candidate.lat, candidate.lon, cache)
+            candidate.detail = label or f"≈{candidate.lat:.2f}, {candidate.lon:.2f}"
+
         chosen = (picker or terminal_picker)(candidates)
         if chosen is None:
             return None
@@ -481,27 +490,32 @@ def search_businesses(
 _last_nominatim_request_at = 0.0
 
 
-def _nominatim_lookup(params: dict, cache_key: str, cache: Cache) -> Optional[tuple[float, float]]:
-    """Shared Nominatim /search call: rate-limited, cached permanently."""
+def _nominatim_request(url: str, params: dict):
+    """Rate-limited GET against a Nominatim endpoint. Returns parsed JSON."""
     global _last_nominatim_request_at
-
-    cached = cache.get_geocode(cache_key)
-    if cached is not None:
-        return cached
 
     elapsed = time.monotonic() - _last_nominatim_request_at
     if elapsed < NOMINATIM_MIN_INTERVAL_SECONDS:
         time.sleep(NOMINATIM_MIN_INTERVAL_SECONDS - elapsed)
 
     response = requests.get(
-        NOMINATIM_URL,
-        params={**params, "format": "json", "limit": 1},
+        url,
+        params={**params, "format": "json"},
         headers={"User-Agent": NOMINATIM_USER_AGENT},
         timeout=10,
     )
     _last_nominatim_request_at = time.monotonic()
     response.raise_for_status()
-    results = response.json()
+    return response.json()
+
+
+def _nominatim_lookup(params: dict, cache_key: str, cache: Cache) -> Optional[tuple[float, float]]:
+    """Shared Nominatim /search call: rate-limited, cached permanently."""
+    cached = cache.get_geocode(cache_key)
+    if cached is not None:
+        return cached
+
+    results = _nominatim_request(NOMINATIM_SEARCH_URL, {**params, "limit": 1})
     if not results:
         return None
 
@@ -525,6 +539,39 @@ def geocode_postal_code(postal_code: str, cache: Cache) -> Optional[tuple[float,
     """
     cache_key = f"postal:{postal_code.strip().lower()}"
     return _nominatim_lookup({"postalcode": postal_code}, cache_key, cache)
+
+
+def _reverse_geocode_label(lat: float, lon: float, cache: Cache) -> Optional[str]:
+    """Reverse-geocode a point to a short "County, State" style label.
+
+    Used only to disambiguate same-named admin boundaries whose own OSM
+    tags carry nothing useful (see find_named_area_candidates/
+    resolve_named_area) — rounds to ~100m for the cache key since this is
+    for telling places apart, not pinpoint accuracy.
+    """
+    cache_key = f"{lat:.3f},{lon:.3f}"
+    cached = cache.get_reverse_geocode(cache_key)
+    if cached is not None:
+        return cached or None
+
+    try:
+        data = _nominatim_request(
+            NOMINATIM_REVERSE_URL,
+            {"lat": lat, "lon": lon, "zoom": 10, "addressdetails": 1},
+        )
+    except requests.RequestException:
+        return None
+
+    address = data.get("address", {}) if isinstance(data, dict) else {}
+    county = address.get("county")
+    state = address.get("state") or address.get("state_district")
+    parts = [part for part in (county, state) if part]
+    if not parts and address.get("country_code"):
+        parts = [address["country_code"].upper()]
+    label = ", ".join(parts) if parts else None
+
+    cache.set_reverse_geocode(cache_key, label or "")
+    return label
 
 
 # ============================================================

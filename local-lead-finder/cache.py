@@ -82,6 +82,15 @@ class Cache:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS reverse_geocode_cache (
+                    coord_key  TEXT PRIMARY KEY,
+                    label      TEXT NOT NULL,
+                    fetched_at REAL NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS site_cache (
                     domain      TEXT PRIMARY KEY,
                     result_json TEXT NOT NULL,
@@ -166,6 +175,35 @@ class Cache:
                     fetched_at = excluded.fetched_at
                 """,
                 (address_key, lat, lon),
+            )
+
+    # -- Permanent reverse-geocode cache (same Nominatim policy as above) --
+    # WHY: find_named_area_candidates()/resolve_named_area() in osm_source.py
+    #      reverse-geocode a boundary's center point to disambiguate two
+    #      same-named places when OSM's own tags don't say enough. Cached
+    #      by rounded coordinate rather than address text.
+
+    def get_reverse_geocode(self, coord_key: str) -> Optional[str]:
+        """The cached label for this coordinate, "" if looked up but nothing
+        was found, or None if it has never been looked up."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT label FROM reverse_geocode_cache WHERE coord_key = ?",
+                (coord_key,),
+            ).fetchone()
+        return row[0] if row else None
+
+    def set_reverse_geocode(self, coord_key: str, label: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO reverse_geocode_cache (coord_key, label, fetched_at)
+                VALUES (?, ?, strftime('%s', 'now'))
+                ON CONFLICT(coord_key) DO UPDATE SET
+                    label = excluded.label,
+                    fetched_at = excluded.fetched_at
+                """,
+                (coord_key, label),
             )
 
     # -- Website enrichment cache, keyed by domain, with a TTL -------
