@@ -238,9 +238,13 @@ class App(ttk.Frame):
             command=self._on_area_mode_changed,
         ).grid(row=0, column=0, sticky="w")
         ttk.Radiobutton(
-            bar, text="Coordinates + radius", variable=self.area_mode_var, value="radius",
+            bar, text="ZIP / postal code", variable=self.area_mode_var, value="zip",
             command=self._on_area_mode_changed,
         ).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Radiobutton(
+            bar, text="Coordinates + radius", variable=self.area_mode_var, value="radius",
+            command=self._on_area_mode_changed,
+        ).grid(row=0, column=2, sticky="w", padx=(8, 0))
 
         # -- Mode A widgets: a single place-name entry --
         self.named_frame = ttk.Frame(bar)
@@ -250,7 +254,14 @@ class App(ttk.Frame):
             side="left", padx=(4, 0)
         )
 
-        # -- Mode B widgets: lat/lon entries + a miles radius slider --
+        # -- Mode "zip" widgets: a ZIP/postal code entry (radius slider is
+        #    shared with Mode B via radius_only_frame below) --
+        self.zip_frame = ttk.Frame(bar)
+        ttk.Label(self.zip_frame, text="ZIP / postal code:").pack(side="left")
+        self.zip_var = tk.StringVar()
+        ttk.Entry(self.zip_frame, textvariable=self.zip_var, width=12).pack(side="left", padx=(4, 0))
+
+        # -- Mode B widgets: lat/lon entries only --
         self.radius_frame = ttk.Frame(bar)
         ttk.Label(self.radius_frame, text="Lat:").pack(side="left")
         self.lat_var = tk.StringVar()
@@ -260,22 +271,25 @@ class App(ttk.Frame):
         ttk.Label(self.radius_frame, text="Lon:").pack(side="left")
         self.lon_var = tk.StringVar()
         ttk.Entry(self.radius_frame, textvariable=self.lon_var, width=10).pack(
-            side="left", padx=(4, 8)
+            side="left", padx=(4, 0)
         )
-        ttk.Label(self.radius_frame, text="Radius (mi):").pack(side="left")
+
+        # -- the miles radius slider, shared by "zip" and "radius" modes --
+        self.radius_only_frame = ttk.Frame(bar)
+        ttk.Label(self.radius_only_frame, text="Radius (mi):").pack(side="left")
         self.radius_var = tk.DoubleVar(value=5.0)
         self.radius_label_var = tk.StringVar(value="5")
         ttk.Scale(
-            self.radius_frame, from_=1, to=25, orient="horizontal", variable=self.radius_var,
+            self.radius_only_frame, from_=1, to=25, orient="horizontal", variable=self.radius_var,
             command=self._on_radius_changed, length=140,
         ).pack(side="left", padx=(4, 4))
-        ttk.Label(self.radius_frame, textvariable=self.radius_label_var, width=3).pack(side="left")
+        ttk.Label(self.radius_only_frame, textvariable=self.radius_label_var, width=3).pack(side="left")
 
         self.named_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         # -- category toggles --
         category_frame = ttk.Frame(bar)
-        category_frame.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        category_frame.grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
         ttk.Label(category_frame, text="Categories:").pack(side="left")
         self.category_vars: dict[str, tk.BooleanVar] = {}
         for key in ALL_CATEGORY_KEYS:
@@ -285,7 +299,7 @@ class App(ttk.Frame):
 
         # -- action buttons --
         button_frame = ttk.Frame(bar)
-        button_frame.grid(row=0, column=4, rowspan=3, sticky="e", padx=(20, 0))
+        button_frame.grid(row=0, column=4, rowspan=4, sticky="e", padx=(20, 0))
         bar.grid_columnconfigure(4, weight=1)
         self.search_button = ttk.Button(button_frame, text="Search", command=self._on_search_clicked)
         self.search_button.pack(side="left", padx=4)
@@ -419,12 +433,21 @@ class App(ttk.Frame):
     # -- top-bar interaction -------------------------------------
 
     def _on_area_mode_changed(self) -> None:
-        if self.area_mode_var.get() == "named":
-            self.radius_frame.grid_remove()
+        mode = self.area_mode_var.get()
+
+        self.named_frame.grid_remove()
+        self.zip_frame.grid_remove()
+        self.radius_frame.grid_remove()
+        self.radius_only_frame.grid_remove()
+
+        if mode == "named":
             self.named_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        else:
-            self.named_frame.grid_remove()
+        elif mode == "zip":
+            self.zip_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+            self.radius_only_frame.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        else:  # "radius"
             self.radius_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+            self.radius_only_frame.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
     def _on_radius_changed(self, value: str) -> None:
         self.radius_label_var.set(str(round(float(value))))
@@ -607,13 +630,20 @@ class App(ttk.Frame):
             messagebox.showerror("Local Lead Finder", "Select at least one category.")
             return
 
-        if self.area_mode_var.get() == "named":
+        mode = self.area_mode_var.get()
+        if mode == "named":
             area_name = self.area_name_var.get().strip()
             if not area_name:
                 messagebox.showerror("Local Lead Finder", "Enter a place name.")
                 return
             search_params = {"mode": "named", "area_name": area_name}
-        else:
+        elif mode == "zip":
+            zip_code = self.zip_var.get().strip()
+            if not zip_code:
+                messagebox.showerror("Local Lead Finder", "Enter a ZIP / postal code.")
+                return
+            search_params = {"mode": "zip", "zip_code": zip_code, "radius": self.radius_var.get()}
+        else:  # "radius"
             try:
                 lat = float(self.lat_var.get())
                 lon = float(self.lon_var.get())
@@ -663,7 +693,18 @@ class App(ttk.Frame):
                 if area is None:
                     self.result_queue.put(("error", f'No match found for "{params["area_name"]}".'))
                     return
-            else:
+            elif params["mode"] == "zip":
+                self._status_cb(f"Looking up ZIP/postal code {params['zip_code']}...")
+                center = osm_source.geocode_postal_code(params["zip_code"], self.cache)
+                if center is None:
+                    self.result_queue.put(
+                        ("error", f"Couldn't find ZIP/postal code \"{params['zip_code']}\".")
+                    )
+                    return
+                lat, lon = center
+                label = f"{params['radius']:g} mi around ZIP {params['zip_code']}"
+                area = osm_source.make_radius_area(lat, lon, params["radius"], label=label)
+            else:  # "radius"
                 area = osm_source.make_radius_area(params["lat"], params["lon"], params["radius"])
 
             if self.cancel_event.is_set():

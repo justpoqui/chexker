@@ -59,6 +59,8 @@ class AreaCandidate:
     name: str
     admin_level: Optional[str]
     detail: str  # extra tags (state/country) shown to disambiguate in a picker
+    lat: Optional[float] = None
+    lon: Optional[float] = None
 
     @property
     def area_id(self) -> int:
@@ -224,18 +226,37 @@ def find_named_area_candidates(
     candidates = []
     for element in data.get("elements", []):
         tags = element.get("tags", {})
+        center = element.get("center", {})
+        lat, lon = center.get("lat"), center.get("lon")
+
+        # Real admin_level=8 boundary relations very often carry NONE of
+        # addr:state/is_in — those are conventions for buildings and POIs,
+        # not administrative boundaries. ISO3166-2 (e.g. "US-FL") and a
+        # county tag are much more commonly present on the boundary itself.
         detail_parts = [
             tags.get(key)
-            for key in ("addr:state", "is_in:state", "is_in", "addr:country")
+            for key in (
+                "addr:state", "is_in:state", "addr:county", "is_in:county",
+                "ISO3166-2", "is_in", "addr:country",
+            )
             if tags.get(key)
         ]
+        detail = ", ".join(dict.fromkeys(detail_parts))
+        if not detail and lat is not None and lon is not None:
+            # Last resort: nothing in OSM's tags disambiguates this one, but
+            # a rough coordinate at least lets a human recognize "that's the
+            # Florida one" from the picker instead of seeing identical rows.
+            detail = f"≈{lat:.2f}, {lon:.2f}"
+
         candidates.append(
             AreaCandidate(
                 osm_type=element["type"],
                 osm_id=element["id"],
                 name=tags.get("name", name),
                 admin_level=tags.get("admin_level"),
-                detail=", ".join(dict.fromkeys(detail_parts)),
+                detail=detail,
+                lat=lat,
+                lon=lon,
             )
         )
     return candidates
@@ -287,9 +308,12 @@ def resolve_named_area(
 MILES_TO_METERS = 1609.344
 
 
-def make_radius_area(lat: float, lon: float, radius_miles: float) -> SearchArea:
+def make_radius_area(
+    lat: float, lon: float, radius_miles: float, label: Optional[str] = None
+) -> SearchArea:
     radius_m = radius_miles * MILES_TO_METERS
-    label = f"{radius_miles:g} mi around ({lat:.4f}, {lon:.4f})"
+    if label is None:
+        label = f"{radius_miles:g} mi around ({lat:.4f}, {lon:.4f})"
     return SearchArea(mode="radius", label=label, lat=lat, lon=lon, radius_m=radius_m)
 
 
@@ -438,25 +462,30 @@ def search_businesses(
 
 
 # ============================================================
-# STEP 2 — OPTIONAL: Nominatim geocoding (off by default)
-# WHY: turning a typed street address into lat/lon needs a
-#      geocoder, and Nominatim is the only free, key-less option.
-#      Its usage policy is strict: a real User-Agent, at most one
-#      request per second, and permanent local caching of every
-#      result — see https://operations.osmfoundation.org/policies/nominatim/
-#      This function is never called unless a future GUI checkbox
-#      (off by default) turns it on.
+# STEP 2/16 — NOMINATIM GEOCODING
+# WHY: turning a typed address or ZIP/postal code into lat/lon
+#      needs a geocoder, and Nominatim is the only free, key-less
+#      option. Its usage policy is strict: a real User-Agent, at
+#      most one request per second, and permanent local caching of
+#      every result — see
+#      https://operations.osmfoundation.org/policies/nominatim/
+#      geocode_postal_code() is wired to the GUI's "ZIP/postal code"
+#      search mode (STEP 16) — one geocode call per search, the same
+#      order of request volume as resolving a named area, so it's a
+#      normal always-available mode rather than a per-business
+#      operation needing its own opt-in. geocode_address() is kept
+#      available for the same purpose against a free-text address,
+#      should a future mode want one.
 # ============================================================
 
 _last_nominatim_request_at = 0.0
 
 
-def geocode_address(address: str, cache: Cache) -> Optional[tuple[float, float]]:
-    """Look up an address via Nominatim, permanently caching the result."""
+def _nominatim_lookup(params: dict, cache_key: str, cache: Cache) -> Optional[tuple[float, float]]:
+    """Shared Nominatim /search call: rate-limited, cached permanently."""
     global _last_nominatim_request_at
 
-    address_key = address.strip().lower()
-    cached = cache.get_geocode(address_key)
+    cached = cache.get_geocode(cache_key)
     if cached is not None:
         return cached
 
@@ -466,7 +495,7 @@ def geocode_address(address: str, cache: Cache) -> Optional[tuple[float, float]]
 
     response = requests.get(
         NOMINATIM_URL,
-        params={"q": address, "format": "json", "limit": 1},
+        params={**params, "format": "json", "limit": 1},
         headers={"User-Agent": NOMINATIM_USER_AGENT},
         timeout=10,
     )
@@ -477,8 +506,25 @@ def geocode_address(address: str, cache: Cache) -> Optional[tuple[float, float]]
         return None
 
     lat, lon = float(results[0]["lat"]), float(results[0]["lon"])
-    cache.set_geocode(address_key, lat, lon)
+    cache.set_geocode(cache_key, lat, lon)
     return (lat, lon)
+
+
+def geocode_address(address: str, cache: Cache) -> Optional[tuple[float, float]]:
+    """Look up a free-text address via Nominatim, permanently caching it."""
+    cache_key = f"address:{address.strip().lower()}"
+    return _nominatim_lookup({"q": address}, cache_key, cache)
+
+
+def geocode_postal_code(postal_code: str, cache: Cache) -> Optional[tuple[float, float]]:
+    """Look up a ZIP/postal code's approximate center via Nominatim.
+
+    Uses Nominatim's structured `postalcode` parameter rather than free-text
+    `q`, which resolves a bare code (US ZIP, Canadian postal code, etc.)
+    much more reliably.
+    """
+    cache_key = f"postal:{postal_code.strip().lower()}"
+    return _nominatim_lookup({"postalcode": postal_code}, cache_key, cache)
 
 
 # ============================================================
@@ -495,6 +541,11 @@ if __name__ == "__main__":
         _, _, lat, lon, radius = sys.argv
         area = make_radius_area(float(lat), float(lon), float(radius))
         print(area)
+
+    elif len(sys.argv) >= 2 and sys.argv[1] == "zip":
+        _, _, zip_code = sys.argv
+        center = geocode_postal_code(zip_code, cache)
+        print(center if center else f"Couldn't geocode ZIP/postal code {zip_code!r}.")
 
     elif len(sys.argv) >= 2 and sys.argv[1] == "businesses":
         _, _, place_name, *category_keys = sys.argv
@@ -522,4 +573,5 @@ if __name__ == "__main__":
         print("Usage:")
         print('  python osm_source.py "Grand Rapids"')
         print("  python osm_source.py radius 42.9634 -85.6681 5")
+        print("  python osm_source.py zip 49503")
         print('  python osm_source.py businesses "Grand Rapids" shop craft office')

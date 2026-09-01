@@ -45,15 +45,17 @@ build one yourself with PyInstaller.
   background-thread-to-UI bridge (a `queue.Queue` polled with `after()` so
   network calls never freeze the window).
 
-- **`osm_source.py`** — The only module allowed to talk to the Overpass API.
-  Resolves a search area (either a named place OSM already knows, or a
-  coordinate + radius), then runs the actual business query (shops, offices,
-  crafts, etc. that have a `name` tag). Handles Overpass's politeness
-  requirements: POST the query, one request at a time, a real User-Agent,
-  and exponential backoff on rate-limit or timeout responses. Rotates
-  through `OVERPASS_ENDPOINTS` (a plain tuple of mirror URLs at the top of
-  the file — add one to grow the list) if the current mirror is down or
-  stays throttled past its backoff schedule.
+- **`osm_source.py`** — The only module allowed to talk to the Overpass API
+  (and, for ZIP/postal code search, Nominatim). Resolves a search area one
+  of three ways — a named place OSM already knows, a ZIP/postal code
+  geocoded to its approximate center, or raw coordinates + radius — then
+  runs the actual business query (shops, offices, crafts, etc. that have a
+  `name` tag). Handles Overpass's politeness requirements: POST the query,
+  one request at a time, a real User-Agent, and exponential backoff on
+  rate-limit or timeout responses. Rotates through `OVERPASS_ENDPOINTS` (a
+  plain tuple of mirror URLs at the top of the file — add one to grow the
+  list) if the current mirror is down or stays throttled past its backoff
+  schedule.
 
 - **`enrich.py`** — For every business that lists a real website (as opposed
   to a Facebook/Instagram link masquerading as one), fetches that site once
@@ -85,8 +87,9 @@ build one yourself with PyInstaller.
   often missing entirely, and a business with no `website` tag in OSM may
   still have a real website that nobody has recorded there yet. Treat every
   "no website" result as a hypothesis to verify by hand, not a fact.
-- If the optional Nominatim geocoder is ever enabled, it is used strictly
-  according to the [Nominatim usage policy](https://operations.osmfoundation.org/policies/nominatim/):
+- ZIP/postal code search uses [Nominatim](https://nominatim.org/) for one
+  geocode lookup per search (never per business), used strictly according
+  to the [Nominatim usage policy](https://operations.osmfoundation.org/policies/nominatim/):
   a descriptive User-Agent, at most one request per second, and permanent
   local caching of every result.
 - This app never determines whether a Facebook page is active or abandoned.
