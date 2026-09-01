@@ -297,7 +297,11 @@ class App(ttk.Frame):
         ).pack(side="left", padx=(4, 4))
         ttk.Label(self.radius_only_frame, textvariable=self.radius_label_var, width=3).pack(side="left")
 
-        self.named_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        # Sets up the correct widget visibility for the "named" default
+        # (previously a duplicate hardcoded grid() call here that didn't
+        # match what _on_area_mode_changed shows, which is exactly how the
+        # radius slider went missing from the default view before).
+        self._on_area_mode_changed()
 
         # -- category toggles --
         category_frame = ttk.Frame(bar)
@@ -454,6 +458,11 @@ class App(ttk.Frame):
 
         if mode == "named":
             self.named_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+            # Some place names (unincorporated communities/CDPs) resolve to
+            # a point with no boundary at all -- see
+            # osm_source.resolve_named_area()'s point_radius_miles fallback
+            # -- so the radius slider applies here too, not just zip/radius.
+            self.radius_only_frame.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
         elif mode == "zip":
             self.zip_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
             self.radius_only_frame.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
@@ -648,8 +657,15 @@ class App(ttk.Frame):
             if not area_name:
                 messagebox.showerror("Local Lead Finder", "Enter a place name.")
                 return
-            state_iso = STATE_NAME_TO_ISO.get(self.state_var.get())
-            search_params = {"mode": "named", "area_name": area_name, "state_iso": state_iso}
+            selected_state = self.state_var.get()
+            state_name = None if selected_state == ANY_STATE_LABEL else selected_state
+            search_params = {
+                "mode": "named",
+                "area_name": area_name,
+                "state_name": state_name,
+                "state_iso": STATE_NAME_TO_ISO.get(selected_state),
+                "radius": self.radius_var.get(),
+            }
         elif mode == "zip":
             zip_code = self.zip_var.get().strip()
             if not zip_code:
@@ -702,7 +718,8 @@ class App(ttk.Frame):
             if params["mode"] == "named":
                 area = osm_source.resolve_named_area(
                     params["area_name"], self.cache, picker=self._gui_picker,
-                    status_cb=self._status_cb, state_iso=params.get("state_iso"),
+                    status_cb=self._status_cb, state_name=params.get("state_name"),
+                    state_iso=params.get("state_iso"), point_radius_miles=params.get("radius", 5.0),
                 )
                 if area is None:
                     self.result_queue.put(("error", f'No match found for "{params["area_name"]}".'))

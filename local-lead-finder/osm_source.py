@@ -52,29 +52,38 @@ OVERPASS_BACKOFF_SCHEDULE = (2, 4, 8, 16)
 
 @dataclass
 class AreaCandidate:
-    """One administrative-boundary match for a searched name."""
+    """One place matching a searched name: either a real administrative
+    boundary (admin_level set) or a place=* node/way with no boundary at
+    all (place_value set instead) -- see find_named_area_candidates()."""
 
-    osm_type: str  # "relation" or "way"
+    osm_type: str  # "node", "way", or "relation"
     osm_id: int
     name: str
     admin_level: Optional[str]
     detail: str  # extra tags (state/country) shown to disambiguate in a picker
+    place_value: Optional[str] = None  # e.g. "suburb", "census_designated_place"
     lat: Optional[float] = None
     lon: Optional[float] = None
 
     @property
     def area_id(self) -> int:
-        # Overpass's documented convention for turning an OSM element into
+        # Overpass's documented convention for turning a way/relation into
         # an area id: ways get a 2.4 billion offset, relations a 3.6 billion
         # offset. This lets STEP 3 write area(id:...) directly, with no
-        # second name lookup needed.
+        # second name lookup needed. A bare node (common for small
+        # unincorporated communities -- see find_named_area_candidates) has
+        # no polygon to convert; resolve_named_area() checks osm_type and
+        # falls back to a radius search around it instead of calling this.
+        if self.osm_type == "node":
+            raise ValueError("a node candidate has no area id; use its lat/lon instead")
         offset = 2_400_000_000 if self.osm_type == "way" else 3_600_000_000
         return offset + self.osm_id
 
     def __str__(self) -> str:
-        level = f", admin_level {self.admin_level}" if self.admin_level else ""
+        kind = self.admin_level and f", admin_level {self.admin_level}"
+        kind = kind or (self.place_value and f", {self.place_value}") or ""
         detail = f" — {self.detail}" if self.detail else ""
-        return f"{self.name}{level}{detail}"
+        return f"{self.name}{kind}{detail}"
 
 
 @dataclass
@@ -206,11 +215,24 @@ def _escape_ql_string(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
+# Unincorporated communities and Census-designated places (CDPs) are real,
+# named towns -- Brandon, FL is one, along with its neighbors Valrico,
+# Seffner, and Mango -- but very often have NO administrative boundary in
+# OSM at all, only a place=* node/way marking where they are. Matching only
+# boundary=administrative admin_level=8 (the original query) silently
+# excludes every one of these; this list of place= values is what widens
+# find_named_area_candidates() to also catch them.
+PLACE_VALUES = (
+    "city", "town", "village", "hamlet", "suburb", "neighbourhood",
+    "unincorporated_community", "census_designated_place", "locality",
+)
+
 # US states + DC, for the GUI's optional state filter. Name -> ISO3166-2
-# code, matching the tag Overpass carries on each state's own admin_level=4
-# boundary (e.g. "US-FL") -- used to filter *spatially*, not by the child
-# boundary's own tags, since most admin_level=8 relations don't reliably
-# carry addr:state/is_in:state themselves (see the detail-tag comment below).
+# code. resolve_named_area() filters candidates against this state *after*
+# fetching them (by tag when present, else by reverse-geocoding each one's
+# center point) rather than asking Overpass to filter spatially up front --
+# that turned out to depend on the area index being complete and current on
+# whichever Overpass mirror answered, which isn't reliable enough to trust.
 US_STATES = [
     ("Alabama", "US-AL"), ("Alaska", "US-AK"), ("Arizona", "US-AZ"), ("Arkansas", "US-AR"),
     ("California", "US-CA"), ("Colorado", "US-CO"), ("Connecticut", "US-CT"), ("Delaware", "US-DE"),
@@ -232,43 +254,45 @@ def find_named_area_candidates(
     name: str,
     cache: Cache,
     status_cb: Callable[[str], None] = lambda msg: None,
-    state_iso: Optional[str] = None,
 ) -> list[AreaCandidate]:
-    """Look up every admin_level=8 boundary matching `name`.
-
-    If `state_iso` (e.g. "US-FL") is given, results are restricted to
-    boundaries spatially contained in that state's own admin_level=4
-    boundary, rather than by any state tag on the admin_level=8 boundary
-    itself — see the US_STATES comment above for why.
+    """Look up every place matching `name`: real admin_level=8 boundaries
+    (incorporated cities/towns/villages) *and* place=* nodes/ways/relations
+    (unincorporated communities and CDPs -- see the PLACE_VALUES comment
+    above). A boundary candidate can be searched directly with
+    area(id:...); a bare place node has no polygon, so resolve_named_area()
+    falls back to a radius search centered on it instead.
     """
     escaped = _escape_ql_string(name)
-    if state_iso:
-        escaped_state = _escape_ql_string(state_iso)
-        header = (
-            "[out:json][timeout:60];\n"
-            f'area["boundary"="administrative"]["admin_level"="4"]'
-            f'["ISO3166-2"="{escaped_state}"]->.state;\n'
-        )
-        area_clause = "(area.state)"
-    else:
-        header = "[out:json][timeout:60];\n"
-        area_clause = ""
-
+    place_regex = "|".join(PLACE_VALUES)
     query = (
-        header +
+        "[out:json][timeout:60];\n"
         "(\n"
-        f'  relation["name"="{escaped}"]["boundary"="administrative"]["admin_level"="8"]{area_clause};\n'
-        f'  way["name"="{escaped}"]["boundary"="administrative"]["admin_level"="8"]{area_clause};\n'
+        f'  relation["name"="{escaped}"]["boundary"="administrative"]["admin_level"="8"];\n'
+        f'  way["name"="{escaped}"]["boundary"="administrative"]["admin_level"="8"];\n'
+        f'  node["name"="{escaped}"]["place"~"^({place_regex})$"];\n'
+        f'  way["name"="{escaped}"]["place"~"^({place_regex})$"];\n'
+        f'  relation["name"="{escaped}"]["place"~"^({place_regex})$"];\n'
         ");\n"
         "out tags center;"
     )
     data = query_overpass(query, cache, status_cb)
 
     candidates = []
+    seen: set[tuple[str, int]] = set()
     for element in data.get("elements", []):
+        key = (element["type"], element["id"])
+        if key in seen:
+            # A boundary relation that also carries place=town would
+            # otherwise match both the admin_level and place clauses above.
+            continue
+        seen.add(key)
+
         tags = element.get("tags", {})
-        center = element.get("center", {})
-        lat, lon = center.get("lat"), center.get("lon")
+        if element["type"] == "node":
+            lat, lon = element.get("lat"), element.get("lon")
+        else:
+            center = element.get("center", {})
+            lat, lon = center.get("lat"), center.get("lon")
 
         # Real admin_level=8 boundary relations very often carry NONE of
         # addr:state/is_in — those are conventions for buildings and POIs,
@@ -288,12 +312,14 @@ def find_named_area_candidates(
         # name is actually ambiguous (no point spending a Nominatim call on
         # every single-match search).
 
+        admin_level = tags.get("admin_level")
         candidates.append(
             AreaCandidate(
                 osm_type=element["type"],
                 osm_id=element["id"],
                 name=tags.get("name", name),
-                admin_level=tags.get("admin_level"),
+                admin_level=admin_level,
+                place_value=None if admin_level else tags.get("place"),
                 detail=detail,
                 lat=lat,
                 lon=lon,
@@ -313,26 +339,76 @@ def terminal_picker(candidates: list[AreaCandidate]) -> Optional[AreaCandidate]:
     return candidates[int(choice) - 1]
 
 
+def _candidate_in_state(
+    candidate: AreaCandidate,
+    state_name: str,
+    state_iso: Optional[str],
+    cache: Cache,
+) -> Optional[bool]:
+    """True/False if we can tell whether `candidate` is in this US state;
+    None if we couldn't determine it at all (e.g. Nominatim unreachable) --
+    callers should keep candidates we're unsure about rather than risk
+    hiding the one the user actually wants.
+
+    Checks the candidate's own OSM tags first (cheap, but rarely present —
+    see the detail-tag comment in find_named_area_candidates), then falls
+    back to the same reverse-geocode lookup used for picker disambiguation.
+    """
+    if candidate.detail:
+        haystack = candidate.detail.lower()
+        if state_name.lower() in haystack or (state_iso and state_iso.lower() in haystack):
+            return True
+
+    if candidate.lat is None or candidate.lon is None:
+        return None
+
+    address = _reverse_geocode_address(candidate.lat, candidate.lon, cache)
+    actual_state = (address.get("state") or "").strip().lower()
+    if not actual_state:
+        return None
+    return actual_state == state_name.strip().lower()
+
+
 def resolve_named_area(
     name: str,
     cache: Cache,
     picker: Optional[PickerFn] = None,
     status_cb: Callable[[str], None] = lambda msg: None,
+    state_name: Optional[str] = None,
     state_iso: Optional[str] = None,
+    point_radius_miles: float = 5.0,
 ) -> Optional[SearchArea]:
     """Resolve a place name to a SearchArea, prompting `picker` on ambiguity.
 
-    `state_iso` (e.g. "US-FL", from the GUI's optional state dropdown)
-    narrows the search to one state up front, which is usually enough to
-    turn an ambiguous name into a single match with no picker needed at
-    all — see find_named_area_candidates().
+    `state_name`/`state_iso` (e.g. "Florida"/"US-FL", from the GUI's
+    optional state dropdown) narrow an ambiguous name down to one state,
+    usually leaving a single match with no picker needed — see
+    _candidate_in_state() above.
+
+    A chosen candidate with no administrative boundary (a bare place=*
+    node — see find_named_area_candidates) becomes a `point_radius_miles`
+    radius search centered on it instead of an area(id:...) search, since
+    there's no polygon to search within.
 
     Returns None if no matches were found, or if the picker returned None
     (the user cancelled).
     """
-    candidates = find_named_area_candidates(name, cache, status_cb, state_iso=state_iso)
+    candidates = find_named_area_candidates(name, cache, status_cb)
     if not candidates:
         return None
+
+    if state_name:
+        status_cb(f"Narrowing {len(candidates)} match(es) to {state_name}...")
+        filtered = [
+            c for c in candidates
+            if _candidate_in_state(c, state_name, state_iso, cache) is not False
+        ]
+        # If every candidate got ruled out, trust that over showing nothing
+        # only when we could actually confirm it; otherwise (e.g. Nominatim
+        # unreachable for all of them) fall back to the unfiltered list
+        # rather than falsely reporting "no match found".
+        if filtered:
+            candidates = filtered
 
     if len(candidates) == 1:
         chosen = candidates[0]
@@ -350,6 +426,10 @@ def resolve_named_area(
         chosen = (picker or terminal_picker)(candidates)
         if chosen is None:
             return None
+
+    if chosen.osm_type == "node":
+        label = f"{point_radius_miles:g} mi around {chosen}"
+        return make_radius_area(chosen.lat, chosen.lon, point_radius_miles, label=label)
 
     return SearchArea(mode="named", label=str(chosen), area_id=chosen.area_id)
 
@@ -588,18 +668,22 @@ def geocode_postal_code(postal_code: str, cache: Cache) -> Optional[tuple[float,
     return _nominatim_lookup({"postalcode": postal_code}, cache_key, cache)
 
 
-def _reverse_geocode_label(lat: float, lon: float, cache: Cache) -> Optional[str]:
-    """Reverse-geocode a point to a short "County, State" style label.
+def _reverse_geocode_address(lat: float, lon: float, cache: Cache) -> dict:
+    """Rate-limited, permanently-cached Nominatim /reverse lookup.
 
-    Used only to disambiguate same-named admin boundaries whose own OSM
-    tags carry nothing useful (see find_named_area_candidates/
-    resolve_named_area) — rounds to ~100m for the cache key since this is
-    for telling places apart, not pinpoint accuracy.
+    Returns the raw "address" component dict (county/state/country_code/
+    ...), or {} if the request failed or Nominatim had nothing for this
+    point. Rounds to ~100m for the cache key since every caller here uses
+    this to tell places apart, not for pinpoint accuracy — see
+    find_named_area_candidates/resolve_named_area/_candidate_in_state.
     """
     cache_key = f"{lat:.3f},{lon:.3f}"
     cached = cache.get_reverse_geocode(cache_key)
     if cached is not None:
-        return cached or None
+        try:
+            return json.loads(cached) if cached else {}
+        except json.JSONDecodeError:
+            pass  # pre-JSON cache entry from an older version; refetch
 
     try:
         data = _nominatim_request(
@@ -607,18 +691,24 @@ def _reverse_geocode_label(lat: float, lon: float, cache: Cache) -> Optional[str
             {"lat": lat, "lon": lon, "zoom": 10, "addressdetails": 1},
         )
     except requests.RequestException:
-        return None
+        return {}
 
     address = data.get("address", {}) if isinstance(data, dict) else {}
+    cache.set_reverse_geocode(cache_key, json.dumps(address) if address else "")
+    return address
+
+
+def _reverse_geocode_label(lat: float, lon: float, cache: Cache) -> Optional[str]:
+    """Reverse-geocode a point to a short "County, State" style label, for
+    disambiguating same-named admin boundaries whose own OSM tags carry
+    nothing useful (see find_named_area_candidates/resolve_named_area)."""
+    address = _reverse_geocode_address(lat, lon, cache)
     county = address.get("county")
     state = address.get("state") or address.get("state_district")
     parts = [part for part in (county, state) if part]
     if not parts and address.get("country_code"):
         parts = [address["country_code"].upper()]
-    label = ", ".join(parts) if parts else None
-
-    cache.set_reverse_geocode(cache_key, label or "")
-    return label
+    return ", ".join(parts) if parts else None
 
 
 # ============================================================
