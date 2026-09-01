@@ -49,6 +49,12 @@ TIER_BASE_SCORES = {
 
 PHONE_BONUS = 15
 
+# STEP 13 — a resolving guessed domain doesn't prove the business has a
+# site (could be a squatted domain, an unrelated business, an expired
+# listing) but it's a strong enough hint to demote confidence and force a
+# manual check before calling — see enrich.precall_check_businesses().
+PRECALL_HIT_PENALTY = 30
+
 
 # ============================================================
 # STEP 11 — CHAIN / FRANCHISE DETECTION
@@ -225,6 +231,7 @@ def score_business(
     business: Business,
     enrichment: Optional[EnrichmentResult] = None,
     chain_reason: Optional[str] = None,
+    precall_hits: Optional[list[str]] = None,
 ) -> ScoreResult:
     """Classify one Business into a tier and score.
 
@@ -239,6 +246,12 @@ def score_business(
     detect_name_frequency_chains) is demoted regardless of what tier its
     web presence would otherwise earn — corporate owns that presence, so
     a weak or missing website there isn't a sales opportunity.
+
+    `precall_hits`, when non-empty, means enrich.py's DNS pre-call check
+    (STEP 13) found a guessed domain that actually resolves for a business
+    OSM says has no website. That doesn't confirm the domain is really
+    theirs, so it doesn't change the tier — but it's demoted and flagged
+    for a manual look before anyone dials the phone.
     """
     if chain_reason:
         return ScoreResult(tier="CHAIN", score=TIER_BASE_SCORES["CHAIN"], reasons=[chain_reason])
@@ -292,6 +305,14 @@ def score_business(
         reasons.append(
             f"+{RECENT_EDIT_BONUS}: OSM record edited recently ({edited_date}) — "
             "'no website' is more likely still accurate."
+        )
+
+    if precall_hits:
+        score -= PRECALL_HIT_PENALTY
+        domains = ", ".join(precall_hits)
+        reasons.append(
+            f"-{PRECALL_HIT_PENALTY}: VERIFY BEFORE CALLING — {domains} resolves via DNS. "
+            "Might not be theirs, but check by hand before assuming no website exists."
         )
 
     flags = list(enrichment.flags) if enrichment else []
@@ -397,5 +418,15 @@ if __name__ == "__main__":
         reason = chain_reason_for(business, frequent)
         result = score_business(business, None, reason)
         print(f"{business.name:28s} (id {business.osm_id}) -> {result.tier:10s} score={result.score:3d}  reason={reason}")
+
+    print("\n--- pre-call DNS hit demotes a NO_PRESENCE lead ---")
+    suspect = make_business(name="Suspicious Cafe", phone="555-1234")
+    clean = make_business(name="Genuinely Offline Diner", phone="555-5678")
+    suspect_result = score_business(suspect, None, None, precall_hits=["suspiciouscafe.com"])
+    clean_result = score_business(clean, None, None, precall_hits=[])
+    print(f"with a DNS hit    -> {suspect_result.tier:12s} score={suspect_result.score:3d}  {suspect_result.reasons}")
+    print(f"no DNS hit        -> {clean_result.tier:12s} score={clean_result.score:3d}  {clean_result.reasons}")
+    assert suspect_result.score == clean_result.score - PRECALL_HIT_PENALTY
+    assert suspect_result.tier == "NO_PRESENCE"  # demoted in score, not reclassified
 
     print("\nALL OK")

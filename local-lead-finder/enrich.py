@@ -8,6 +8,7 @@
 
 import random
 import re
+import socket
 import threading
 import time
 import urllib.parse
@@ -265,6 +266,127 @@ def enrich_businesses(
                 status_cb(f"Checked {completed}/{total} websites ({domain})")
 
     return results
+
+
+# ============================================================
+# STEP 13 — PRE-CALL DNS VERIFICATION
+# WHY: "no website" in OSM is a hypothesis, not a fact — the mapper
+#      may simply never have added the tag. Before treating a
+#      NO_PRESENCE/SOCIAL_ONLY business as confirmed, guess a
+#      handful of domains a real one might actually be using and do
+#      a bare DNS lookup against each. This costs nothing (no HTTP
+#      request, no API, stdlib only) and a domain resolving doesn't
+#      *prove* it's theirs — it's a strong enough hint to check by
+#      hand before making an embarrassing sales call to someone who
+#      already has a site.
+#
+#      One part of this was ambiguous in the original ask ("a check
+#      for a matching domain in the phone-number area"); the reading
+#      implemented here folds the phone number's area code into an
+#      extra guessed domain (e.g. "joesbarbershop616.com"), a pattern
+#      real local businesses sometimes use — flagged here in case a
+#      different check was intended.
+# ============================================================
+
+DNS_TIMEOUT_SECONDS = 2.0
+DNS_CACHE_TTL_SECONDS = 30 * 24 * 3600
+MAX_DNS_WORKERS = 10
+GUESSED_DOMAIN_TLDS = (".com", ".net", ".biz")
+
+
+def _name_slugs(name: str) -> list[str]:
+    """A business name into plausible domain-name slugs, e.g.
+    "Joe's Barbershop" -> ["joesbarbershop", "joes-barbershop"]."""
+    # Drop apostrophes rather than treating them as word breaks, so
+    # "Joe's" becomes the single word "joes", not "joe" + "s".
+    name = name.replace("'", "").replace("’", "")
+    words = re.findall(r"[a-z0-9]+", name.lower())
+    if not words:
+        return []
+    slugs = ["".join(words)]
+    hyphenated = "-".join(words)
+    if hyphenated != slugs[0]:
+        slugs.append(hyphenated)
+    return slugs
+
+
+def _area_code(phone: Optional[str]) -> Optional[str]:
+    """The first 3 digits of a US/Canada-style 10-digit phone number."""
+    if not phone:
+        return None
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return digits[:3] if len(digits) == 10 else None
+
+
+def guess_domains(business: Business) -> list[str]:
+    """Plausible domains this business might actually have, despite OSM
+    listing no website tag for it."""
+    slugs = _name_slugs(business.name)
+    domains = [f"{slug}{tld}" for slug in slugs for tld in GUESSED_DOMAIN_TLDS]
+
+    area_code = _area_code(business.phone)
+    if area_code and slugs:
+        domains.append(f"{slugs[0]}{area_code}.com")
+
+    return domains
+
+
+def dns_resolves(domain: str, timeout: float = DNS_TIMEOUT_SECONDS) -> bool:
+    """True if `domain` has any DNS record at all. Pure DNS — no HTTP
+    request is made, so this doesn't touch the guessed site's server."""
+    original_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout)
+    try:
+        socket.getaddrinfo(domain, None)
+        return True
+    except socket.gaierror:
+        return False
+    finally:
+        socket.setdefaulttimeout(original_timeout)
+
+
+def precall_check_businesses(
+    businesses: list[Business],
+    cache: Cache,
+    status_cb: Callable[[str], None] = lambda msg: None,
+) -> dict[str, list[str]]:
+    """For every business with no website tag, guess a few domains and
+    check each via DNS. Returns osm_key -> the guessed domains that
+    actually resolve (empty list omitted), cached per-domain so a repeat
+    search doesn't re-query DNS for the same guess.
+    """
+    candidates = [business for business in businesses if not business.website]
+    if not candidates:
+        return {}
+
+    domain_lookups: list[tuple[str, str]] = [
+        (business.osm_key, domain) for business in candidates for domain in guess_domains(business)
+    ]
+    if not domain_lookups:
+        return {}
+
+    def check_one(osm_key: str, domain: str) -> tuple[str, str, bool]:
+        cached = cache.get_dns(domain, DNS_CACHE_TTL_SECONDS)
+        if cached is not None:
+            return osm_key, domain, cached
+        resolves = dns_resolves(domain)
+        cache.set_dns(domain, resolves)
+        return osm_key, domain, resolves
+
+    hits: dict[str, list[str]] = {}
+    total = len(domain_lookups)
+    with ThreadPoolExecutor(max_workers=MAX_DNS_WORKERS) as pool:
+        futures = [pool.submit(check_one, osm_key, domain) for osm_key, domain in domain_lookups]
+        for i, future in enumerate(as_completed(futures), start=1):
+            osm_key, domain, resolves = future.result()
+            if resolves:
+                hits.setdefault(osm_key, []).append(domain)
+            if i % 10 == 0 or i == total:
+                status_cb(f"Pre-call DNS check: {i}/{total} guessed domains checked")
+
+    return hits
 
 
 # ============================================================

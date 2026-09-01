@@ -700,8 +700,30 @@ class App(ttk.Frame):
                 self.result_queue.put(("cancelled", None))
                 return
 
+            # Pre-call DNS verification (STEP 13) only concerns businesses
+            # with no website tag at all, so it can never disagree with
+            # enrichment (which only ever looks at businesses that DO have
+            # one) — the two update disjoint sets of rows.
+            precall_hits = enrich.precall_check_businesses(
+                businesses, self.cache, status_cb=self._status_cb
+            )
+            for business in businesses:
+                hits = precall_hits.get(business.osm_key)
+                if hits:
+                    result = scoring.score_business(
+                        business, None, chain_reasons[business.osm_key], hits
+                    )
+                    self.result_queue.put(("row_update", business, result))
+
+            if self.cancel_event.is_set():
+                self.result_queue.put(("cancelled", None))
+                return
+
             def on_enriched(business: Business, enrichment) -> None:
-                result = scoring.score_business(business, enrichment, chain_reasons[business.osm_key])
+                result = scoring.score_business(
+                    business, enrichment, chain_reasons[business.osm_key],
+                    precall_hits.get(business.osm_key),
+                )
                 self.result_queue.put(("row_update", business, result))
 
             enrich.enrich_businesses(

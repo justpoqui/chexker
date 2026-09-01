@@ -82,6 +82,15 @@ class Cache:
                 )
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dns_cache (
+                    domain     TEXT PRIMARY KEY,
+                    resolves   INTEGER NOT NULL,
+                    fetched_at REAL NOT NULL
+                )
+                """
+            )
 
     # -- Overpass response cache -----------------------------------
 
@@ -162,6 +171,38 @@ class Cache:
                     fetched_at = excluded.fetched_at
                 """,
                 (domain, json.dumps(result)),
+            )
+
+    # -- DNS pre-call verification cache, keyed by guessed domain ----
+    # WHY: enrich.py guesses several domain spellings per no-website
+    #      business and checks each with a live DNS lookup (STEP 13).
+    #      Re-running the same search shouldn't re-query DNS for a
+    #      domain it already checked.
+
+    def get_dns(self, domain: str, ttl_seconds: float) -> Optional[bool]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT resolves, fetched_at FROM dns_cache WHERE domain = ?",
+                (domain,),
+            ).fetchone()
+        if row is None:
+            return None
+        resolves, fetched_at = row
+        if time.time() - fetched_at > ttl_seconds:
+            return None
+        return bool(resolves)
+
+    def set_dns(self, domain: str, resolves: bool) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO dns_cache (domain, resolves, fetched_at)
+                VALUES (?, ?, strftime('%s', 'now'))
+                ON CONFLICT(domain) DO UPDATE SET
+                    resolves = excluded.resolves,
+                    fetched_at = excluded.fetched_at
+                """,
+                (domain, int(resolves)),
             )
 
     # ============================================================
