@@ -7,13 +7,31 @@
 # ============================================================
 
 import json
+import os
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
 from typing import Optional
 
-DEFAULT_DB_PATH = Path(__file__).resolve().parent / "lead_cache.sqlite3"
+
+def _default_db_path() -> Path:
+    # When packaged (e.g. via PyInstaller --onefile), the app runs from a
+    # temporary extraction directory that's wiped after every launch --
+    # __file__-relative storage there would silently reset the lead
+    # tracking and every cache on each run. Use a real per-user data
+    # directory instead whenever the app is frozen.
+    if getattr(sys, "frozen", False):
+        base = Path(os.environ.get("APPDATA") or Path.home())
+        data_dir = base / "LocalLeadFinder"
+    else:
+        data_dir = Path(__file__).resolve().parent
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir / "lead_cache.sqlite3"
+
+
+DEFAULT_DB_PATH = _default_db_path()
 
 
 # ============================================================

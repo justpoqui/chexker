@@ -29,6 +29,10 @@ pip install -r requirements.txt
 python main.py
 ```
 
+Don't want to install Python at all? See [BUILDING.md](BUILDING.md) for a
+standalone `LocalLeadFinder.exe` — either download one built by CI, or
+build one yourself with PyInstaller.
+
 ## Module map
 
 - **`main.py`** — The entry point. Its only job is to build the pieces

@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 lead_cache.sqlite3
 .venv/
+
+# PyInstaller build output (see LocalLeadFinder.spec / BUILDING.md) --
+# the .exe itself is a build artifact, not source, so it isn't committed.
+build/
+dist/
+*.spec.bak

@@ -1,0 +1,43 @@
+name: Build Windows exe
+
+# WHY: PyInstaller doesn't cross-compile -- a real Windows .exe can only be
+# built by PyInstaller running on Windows. This workflow does that build on
+# GitHub's windows-latest runner, so a working .exe is available as a
+# downloadable artifact without anyone needing an actual Windows machine.
+# See local-lead-finder/BUILDING.md for how to grab it, or build locally.
+
+on:
+  push:
+    branches:
+      - "**"
+    paths:
+      - "local-lead-finder/**"
+      - ".github/workflows/build-windows-exe.yml"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: local-lead-finder
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build LocalLeadFinder.exe
+        run: pyinstaller LocalLeadFinder.spec --noconfirm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LocalLeadFinder-windows-exe
+          path: local-lead-finder/dist/LocalLeadFinder.exe
+          if-no-files-found: error
