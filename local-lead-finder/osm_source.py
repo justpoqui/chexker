@@ -17,7 +17,15 @@ import requests
 
 from cache import Cache
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+# STEP 14: the main instance throttles or goes down often enough that a
+# single hardcoded URL isn't reliable. Add a mirror here (one line) to grow
+# the rotation; query_overpass() tries them in order and moves to the next
+# one whenever the current one fails, rather than giving up.
+OVERPASS_ENDPOINTS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+)
 USER_AGENT = "LocalLeadFinder/1.0 (personal lead research)"
 
 # Nominatim asks that the User-Agent identify the actual application and,
@@ -96,34 +104,28 @@ def _query_hash(query: str) -> str:
     return hashlib.sha256(query.encode("utf-8")).hexdigest()
 
 
-def query_overpass(
+def _query_one_endpoint(
+    endpoint: str,
     query: str,
-    cache: Cache,
-    status_cb: Callable[[str], None] = lambda msg: None,
-) -> dict:
-    """Run one Overpass QL query, using the cache when possible.
+    status_cb: Callable[[str], None],
+) -> str:
+    """POST `query` to one Overpass endpoint, backing off on 429/504.
 
-    Returns the parsed JSON body. Raises requests.RequestException if every
-    retry in OVERPASS_BACKOFF_SCHEDULE is exhausted.
+    Returns the raw response text on success. Raises requests.RequestException
+    (a connection failure, or a non-2xx status after the backoff schedule is
+    exhausted) so the caller — STEP 14's mirror rotation — knows to move on.
     """
-    query_hash = _query_hash(query)
-    cached = cache.get_overpass(query_hash)
-    if cached is not None:
-        status_cb("Loaded from cache (no Overpass request made).")
-        return json.loads(cached)
-
     delays = iter(OVERPASS_BACKOFF_SCHEDULE)
     while True:
-        status_cb("Querying Overpass...")
+        status_cb(f"Querying Overpass ({endpoint})...")
         response = requests.post(
-            OVERPASS_URL,
+            endpoint,
             data={"data": query},
             headers={"User-Agent": USER_AGENT},
             timeout=120,
         )
         if response.status_code == 200:
-            cache.set_overpass(query_hash, query, response.text)
-            return response.json()
+            return response.text
 
         if response.status_code in (429, 504):
             try:
@@ -131,13 +133,61 @@ def query_overpass(
             except StopIteration:
                 response.raise_for_status()
             status_cb(
-                f"Overpass returned {response.status_code}; "
+                f"{endpoint} returned {response.status_code}; "
                 f"backing off {delay}s before retrying..."
             )
             time.sleep(delay)
             continue
 
         response.raise_for_status()
+
+
+# ============================================================
+# STEP 14 — MIRROR FAILOVER
+# WHY: the flagship overpass-api.de instance throttles or goes
+#      down often enough that a single hardcoded URL isn't
+#      reliable for anything but a quick test. Rotating to the
+#      next mirror in OVERPASS_ENDPOINTS (after that mirror's own
+#      backoff schedule is exhausted, or on an outright connection
+#      failure) means one instance having a bad day doesn't stop
+#      the search — it only slows the first query against it down.
+# ============================================================
+
+def query_overpass(
+    query: str,
+    cache: Cache,
+    status_cb: Callable[[str], None] = lambda msg: None,
+) -> dict:
+    """Run one Overpass QL query, using the cache when possible.
+
+    Tries each endpoint in OVERPASS_ENDPOINTS in order, moving to the next
+    one whenever the current one fails (after its own backoff schedule is
+    exhausted). Raises the last endpoint's requests.RequestException only if
+    every endpoint in the list failed.
+    """
+    query_hash = _query_hash(query)
+    cached = cache.get_overpass(query_hash)
+    if cached is not None:
+        status_cb("Loaded from cache (no Overpass request made).")
+        return json.loads(cached)
+
+    last_error: Optional[Exception] = None
+    for i, endpoint in enumerate(OVERPASS_ENDPOINTS):
+        try:
+            response_text = _query_one_endpoint(endpoint, query, status_cb)
+        except requests.RequestException as exc:
+            last_error = exc
+            if i + 1 < len(OVERPASS_ENDPOINTS):
+                status_cb(
+                    f"{endpoint} failed ({exc.__class__.__name__}); "
+                    f"trying {OVERPASS_ENDPOINTS[i + 1]}..."
+                )
+            continue
+
+        cache.set_overpass(query_hash, query, response_text)
+        return json.loads(response_text)
+
+    raise last_error
 
 
 # ============================================================

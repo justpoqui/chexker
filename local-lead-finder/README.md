@@ -46,7 +46,10 @@ python main.py
   coordinate + radius), then runs the actual business query (shops, offices,
   crafts, etc. that have a `name` tag). Handles Overpass's politeness
   requirements: POST the query, one request at a time, a real User-Agent,
-  and exponential backoff on rate-limit or timeout responses.
+  and exponential backoff on rate-limit or timeout responses. Rotates
+  through `OVERPASS_ENDPOINTS` (a plain tuple of mirror URLs at the top of
+  the file — add one to grow the list) if the current mirror is down or
+  stays throttled past its backoff schedule.
 
 - **`enrich.py`** — For every business that lists a real website (as opposed
   to a Facebook/Instagram link masquerading as one), fetches that site once
