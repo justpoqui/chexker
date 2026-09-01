@@ -206,18 +206,59 @@ def _escape_ql_string(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
+# US states + DC, for the GUI's optional state filter. Name -> ISO3166-2
+# code, matching the tag Overpass carries on each state's own admin_level=4
+# boundary (e.g. "US-FL") -- used to filter *spatially*, not by the child
+# boundary's own tags, since most admin_level=8 relations don't reliably
+# carry addr:state/is_in:state themselves (see the detail-tag comment below).
+US_STATES = [
+    ("Alabama", "US-AL"), ("Alaska", "US-AK"), ("Arizona", "US-AZ"), ("Arkansas", "US-AR"),
+    ("California", "US-CA"), ("Colorado", "US-CO"), ("Connecticut", "US-CT"), ("Delaware", "US-DE"),
+    ("District of Columbia", "US-DC"), ("Florida", "US-FL"), ("Georgia", "US-GA"), ("Hawaii", "US-HI"),
+    ("Idaho", "US-ID"), ("Illinois", "US-IL"), ("Indiana", "US-IN"), ("Iowa", "US-IA"),
+    ("Kansas", "US-KS"), ("Kentucky", "US-KY"), ("Louisiana", "US-LA"), ("Maine", "US-ME"),
+    ("Maryland", "US-MD"), ("Massachusetts", "US-MA"), ("Michigan", "US-MI"), ("Minnesota", "US-MN"),
+    ("Mississippi", "US-MS"), ("Missouri", "US-MO"), ("Montana", "US-MT"), ("Nebraska", "US-NE"),
+    ("Nevada", "US-NV"), ("New Hampshire", "US-NH"), ("New Jersey", "US-NJ"), ("New Mexico", "US-NM"),
+    ("New York", "US-NY"), ("North Carolina", "US-NC"), ("North Dakota", "US-ND"), ("Ohio", "US-OH"),
+    ("Oklahoma", "US-OK"), ("Oregon", "US-OR"), ("Pennsylvania", "US-PA"), ("Rhode Island", "US-RI"),
+    ("South Carolina", "US-SC"), ("South Dakota", "US-SD"), ("Tennessee", "US-TN"), ("Texas", "US-TX"),
+    ("Utah", "US-UT"), ("Vermont", "US-VT"), ("Virginia", "US-VA"), ("Washington", "US-WA"),
+    ("West Virginia", "US-WV"), ("Wisconsin", "US-WI"), ("Wyoming", "US-WY"),
+]
+
+
 def find_named_area_candidates(
     name: str,
     cache: Cache,
     status_cb: Callable[[str], None] = lambda msg: None,
+    state_iso: Optional[str] = None,
 ) -> list[AreaCandidate]:
-    """Look up every admin_level=8 boundary matching `name`."""
+    """Look up every admin_level=8 boundary matching `name`.
+
+    If `state_iso` (e.g. "US-FL") is given, results are restricted to
+    boundaries spatially contained in that state's own admin_level=4
+    boundary, rather than by any state tag on the admin_level=8 boundary
+    itself — see the US_STATES comment above for why.
+    """
     escaped = _escape_ql_string(name)
+    if state_iso:
+        escaped_state = _escape_ql_string(state_iso)
+        header = (
+            "[out:json][timeout:60];\n"
+            f'area["boundary"="administrative"]["admin_level"="4"]'
+            f'["ISO3166-2"="{escaped_state}"]->.state;\n'
+        )
+        area_clause = "(area.state)"
+    else:
+        header = "[out:json][timeout:60];\n"
+        area_clause = ""
+
     query = (
-        "[out:json][timeout:60];\n"
+        header +
         "(\n"
-        f'  relation["name"="{escaped}"]["boundary"="administrative"]["admin_level"="8"];\n'
-        f'  way["name"="{escaped}"]["boundary"="administrative"]["admin_level"="8"];\n'
+        f'  relation["name"="{escaped}"]["boundary"="administrative"]["admin_level"="8"]{area_clause};\n'
+        f'  way["name"="{escaped}"]["boundary"="administrative"]["admin_level"="8"]{area_clause};\n'
         ");\n"
         "out tags center;"
     )
@@ -277,13 +318,19 @@ def resolve_named_area(
     cache: Cache,
     picker: Optional[PickerFn] = None,
     status_cb: Callable[[str], None] = lambda msg: None,
+    state_iso: Optional[str] = None,
 ) -> Optional[SearchArea]:
     """Resolve a place name to a SearchArea, prompting `picker` on ambiguity.
+
+    `state_iso` (e.g. "US-FL", from the GUI's optional state dropdown)
+    narrows the search to one state up front, which is usually enough to
+    turn an ambiguous name into a single match with no picker needed at
+    all — see find_named_area_candidates().
 
     Returns None if no matches were found, or if the picker returned None
     (the user cancelled).
     """
-    candidates = find_named_area_candidates(name, cache, status_cb)
+    candidates = find_named_area_candidates(name, cache, status_cb, state_iso=state_iso)
     if not candidates:
         return None
 

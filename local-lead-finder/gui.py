@@ -20,7 +20,10 @@ import export
 import osm_source
 import scoring
 from cache import Cache
-from osm_source import ALL_CATEGORY_KEYS, AreaCandidate, Business
+from osm_source import ALL_CATEGORY_KEYS, US_STATES, AreaCandidate, Business
+
+STATE_NAME_TO_ISO = dict(US_STATES)
+ANY_STATE_LABEL = "Any state"
 from scoring import ScoreResult
 
 CALL_SHEET_LIMIT = 20
@@ -246,13 +249,22 @@ class App(ttk.Frame):
             command=self._on_area_mode_changed,
         ).grid(row=0, column=2, sticky="w", padx=(8, 0))
 
-        # -- Mode A widgets: a single place-name entry --
+        # -- Mode A widgets: a place-name entry, plus an optional state
+        #    filter that turns an ambiguous name ("Brandon" exists in a
+        #    dozen states) into a single match with no picker at all --
+        #    see osm_source.find_named_area_candidates()'s state_iso param.
         self.named_frame = ttk.Frame(bar)
         ttk.Label(self.named_frame, text="Place name:").pack(side="left")
         self.area_name_var = tk.StringVar()
         ttk.Entry(self.named_frame, textvariable=self.area_name_var, width=30).pack(
             side="left", padx=(4, 0)
         )
+        ttk.Label(self.named_frame, text="State:").pack(side="left", padx=(12, 0))
+        self.state_var = tk.StringVar(value=ANY_STATE_LABEL)
+        ttk.Combobox(
+            self.named_frame, textvariable=self.state_var, state="readonly", width=18,
+            values=[ANY_STATE_LABEL] + [name for name, _ in US_STATES],
+        ).pack(side="left", padx=(4, 0))
 
         # -- Mode "zip" widgets: a ZIP/postal code entry (radius slider is
         #    shared with Mode B via radius_only_frame below) --
@@ -636,7 +648,8 @@ class App(ttk.Frame):
             if not area_name:
                 messagebox.showerror("Local Lead Finder", "Enter a place name.")
                 return
-            search_params = {"mode": "named", "area_name": area_name}
+            state_iso = STATE_NAME_TO_ISO.get(self.state_var.get())
+            search_params = {"mode": "named", "area_name": area_name, "state_iso": state_iso}
         elif mode == "zip":
             zip_code = self.zip_var.get().strip()
             if not zip_code:
@@ -688,7 +701,8 @@ class App(ttk.Frame):
         try:
             if params["mode"] == "named":
                 area = osm_source.resolve_named_area(
-                    params["area_name"], self.cache, picker=self._gui_picker, status_cb=self._status_cb
+                    params["area_name"], self.cache, picker=self._gui_picker,
+                    status_cb=self._status_cb, state_iso=params.get("state_iso"),
                 )
                 if area is None:
                     self.result_queue.put(("error", f'No match found for "{params["area_name"]}".'))
