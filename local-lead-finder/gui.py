@@ -382,22 +382,43 @@ class App(ttk.Frame):
         filter_bar = ttk.Frame(table_frame)
         filter_bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
 
-        ttk.Label(filter_bar, text="Filter name:").pack(side="left")
-        ttk.Entry(filter_bar, textvariable=self.name_filter_var, width=20).pack(
+        filter_row1 = ttk.Frame(filter_bar)
+        filter_row1.pack(side="top", fill="x")
+
+        ttk.Label(filter_row1, text="Filter name:").pack(side="left")
+        ttk.Entry(filter_row1, textvariable=self.name_filter_var, width=20).pack(
             side="left", padx=(4, 12)
         )
         self.name_filter_var.trace_add("write", self._on_name_filter_changed)
 
-        ttk.Label(filter_bar, text="Tier:").pack(side="left")
+        ttk.Label(filter_row1, text="Tier:").pack(side="left")
         for tier in TIER_COLORS:
             ttk.Checkbutton(
-                filter_bar, text=TIER_LABELS[tier], variable=self.tier_filter_vars[tier],
+                filter_row1, text=TIER_LABELS[tier], variable=self.tier_filter_vars[tier],
                 command=self._refresh_table_visibility,
             ).pack(side="left", padx=2)
 
-        ttk.Label(filter_bar, textvariable=self.visible_count_var, anchor="e").pack(
+        ttk.Label(filter_row1, textvariable=self.visible_count_var, anchor="e").pack(
             side="right", padx=(12, 0)
         )
+
+        # -- "Places" filter: only shown once a search actually resolves to
+        #    more than one area (a multi-select picker pick, or overlapping
+        #    named + point matches — see _show_area_filter). Ctrl/Shift-click
+        #    selects more than one, the same convention as the area-picker
+        #    popup itself; nothing selected means "show every place
+        #    searched," not "show nothing."
+        self.area_filter_frame = ttk.Frame(filter_bar)
+        ttk.Label(self.area_filter_frame, text="Places (Ctrl/Shift-click for more than one):").pack(
+            side="left", anchor="n"
+        )
+        self.area_listbox = tk.Listbox(
+            self.area_filter_frame, selectmode=tk.EXTENDED, height=3, exportselection=False,
+        )
+        self.area_listbox.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        self.area_listbox.bind("<<ListboxSelect>>", lambda event: self._refresh_table_visibility())
+        # Not packed into filter_bar here -- _show_area_filter() does that
+        # only when there's more than one place to switch between.
 
         self.tree = ttk.Treeview(table_frame, columns=COLUMNS, show="headings")
         for col in COLUMNS:
@@ -568,10 +589,10 @@ class App(ttk.Frame):
 
     def _row_hidden(self, business: Business, result: ScoreResult) -> bool:
         """Whether the results-table filters currently hide this business --
-        "Hide already contacted", the tier checkboxes, and the name filter
-        all apply here so a huge search (a whole state, or several picker
-        candidates searched together) doesn't have to be re-run narrower
-        just to be usable."""
+        "Hide already contacted", the tier checkboxes, the name filter, and
+        the places filter all apply here so a huge search (a whole state,
+        or several picker candidates searched together) doesn't have to be
+        re-run narrower just to be usable."""
         if self.hide_contacted_var.get() and self._lead_status(business.osm_key) != "new":
             return True
         if not self.tier_filter_vars[result.tier].get():
@@ -579,7 +600,25 @@ class App(ttk.Frame):
         name_filter = self.name_filter_var.get().strip().lower()
         if name_filter and name_filter not in business.name.lower():
             return True
+        selected_areas = self._selected_area_labels()
+        if selected_areas and not selected_areas.intersection(business.source_areas):
+            return True
         return False
+
+    def _selected_area_labels(self) -> set[str]:
+        return {self.area_listbox.get(i) for i in self.area_listbox.curselection()}
+
+    def _show_area_filter(self, areas: list) -> None:
+        """Populate the "Places" filter with this search's resolved areas,
+        showing the widget only when there's more than one to switch
+        between (see the area_filter_frame comment in _build_main_area)."""
+        self.area_listbox.delete(0, "end")
+        if len(areas) > 1:
+            for area in areas:
+                self.area_listbox.insert("end", area.label)
+            self.area_filter_frame.pack(side="top", fill="x", pady=(4, 0))
+        else:
+            self.area_filter_frame.pack_forget()
 
     def _insert_or_update_row(self, business: Business, result: ScoreResult) -> None:
         """Update the data model, then reflect it in the tree — but only
@@ -781,6 +820,8 @@ class App(ttk.Frame):
         self.rows.clear()
         self._visible_count = 0
         self.visible_count_var.set("0 / 0 shown")
+        self.area_listbox.delete(0, "end")
+        self.area_filter_frame.pack_forget()
         self._selected_osm_key = None
         self.save_lead_button.configure(state="disabled")
         self._cache_hits = 0
@@ -843,7 +884,10 @@ class App(ttk.Frame):
             # A named-area search can now resolve to more than one area (the
             # picker's Ctrl/Shift-click multi-select — see
             # _AreaPickerDialog); every other mode always yields exactly
-            # one, so this covers all three uniformly.
+            # one, so this covers all three uniformly. The main thread's
+            # "Places" filter (see _show_area_filter) only appears when
+            # there's actually more than one to switch between.
+            self.result_queue.put(("areas_resolved", areas))
             area_label = "; ".join(area.label for area in areas)
             businesses = osm_source.search_businesses_multi(
                 areas, category_keys, self.cache, status_cb=self._status_cb
@@ -952,6 +996,9 @@ class App(ttk.Frame):
 
         if kind == "status":
             self._update_status(message[1])
+
+        elif kind == "areas_resolved":
+            self._show_area_filter(message[1])
 
         elif kind == "pick_area":
             _, candidates, result_holder, done_event = message

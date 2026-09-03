@@ -498,6 +498,11 @@ class Business:
     raw_tags: dict = field(default_factory=dict)
     osm_timestamp: Optional[str] = None  # last-edit time, e.g. "2020-01-15T08:23:41Z" (STEP 12)
     osm_version: Optional[int] = None
+    # Every SearchArea.label this business was found under -- normally just
+    # one, but a multi-select picker search (see search_businesses_multi)
+    # can return the same business under more than one area, and the GUI
+    # lets a user switch the results table to just one selected place.
+    source_areas: list[str] = field(default_factory=list)
 
     @property
     def osm_key(self) -> str:
@@ -616,16 +621,22 @@ def search_businesses_multi(
     """Run search_businesses() over every area — resolve_named_area() can
     return more than one when its picker selects multiple candidates — and
     merge the results, de-duplicating by osm_key since overlapping areas
-    can easily surface the same business twice."""
-    seen: set[str] = set()
-    merged: list[Business] = []
+    can easily surface the same business twice.
+
+    Each returned Business records every area.label it was found under in
+    source_areas, so a caller (the GUI's area filter) can let a user switch
+    the results table between "everywhere searched" and one specific place.
+    """
+    by_key: dict[str, Business] = {}
     for area in areas:
         for business in search_businesses(area, category_keys, cache, status_cb):
-            if business.osm_key in seen:
-                continue
-            seen.add(business.osm_key)
-            merged.append(business)
-    return merged
+            existing = by_key.get(business.osm_key)
+            if existing is None:
+                business.source_areas = [area.label]
+                by_key[business.osm_key] = business
+            elif area.label not in existing.source_areas:
+                existing.source_areas.append(area.label)
+    return list(by_key.values())
 
 
 # ============================================================
