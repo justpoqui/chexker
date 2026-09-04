@@ -292,6 +292,7 @@ DNS_TIMEOUT_SECONDS = 2.0
 DNS_CACHE_TTL_SECONDS = 30 * 24 * 3600
 MAX_DNS_WORKERS = 10
 GUESSED_DOMAIN_TLDS = (".com", ".net", ".biz")
+MAX_DNS_LABEL_LENGTH = 63  # hard DNS/IDNA limit for a single label
 
 
 def _name_slugs(name: str) -> list[str]:
@@ -307,7 +308,13 @@ def _name_slugs(name: str) -> list[str]:
     hyphenated = "-".join(words)
     if hyphenated != slugs[0]:
         slugs.append(hyphenated)
-    return slugs
+    # An unusually long OSM name (long institutional names are common --
+    # churches, community centers, etc.) can build a slug over the DNS
+    # label limit. That's not a real domain guess either way, and passing
+    # it to dns_resolves() crashes with a UnicodeError from the idna codec
+    # ("label too long") instead of just failing to resolve, so drop it
+    # here rather than ever constructing it.
+    return [slug for slug in slugs if len(slug) <= MAX_DNS_LABEL_LENGTH]
 
 
 def _area_code(phone: Optional[str]) -> Optional[str]:
@@ -341,7 +348,12 @@ def dns_resolves(domain: str, timeout: float = DNS_TIMEOUT_SECONDS) -> bool:
     try:
         socket.getaddrinfo(domain, None)
         return True
-    except socket.gaierror:
+    except (socket.gaierror, UnicodeError):
+        # UnicodeError is the idna codec rejecting a malformed hostname
+        # outright (e.g. a label over 63 chars) rather than a normal
+        # not-found. _name_slugs() filters those out before a domain is
+        # ever built, but this is cheap insurance against any other
+        # malformed guess reaching here instead of crashing the search.
         return False
     finally:
         socket.setdefaulttimeout(original_timeout)
